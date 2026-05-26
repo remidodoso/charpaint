@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<!--
+  charpaint — structural shell and styles only.
+  All DOM construction, event handling, and application logic lives in src/lib.rs
+  (compiled to WebAssembly). This file is intentionally kept minimal.
+-->
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>charpaint</title>
+  <style>
+    /* ── Reset ────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Theme variables ──────────────────────────────────────────────────── */
+    /* Switched by toggling data-theme on <html>; Rust does the toggle.       */
+
+    :root[data-theme="dark"] {
+      --bg:         #1e1e1e;
+      --chrome:     #2d2d2d;  /* toolbar, menu bar, palette background */
+      --border:     #444;
+      --text:       #d4d4d4;
+      --text-dim:   #888;
+      --canvas-bg:  #0d0d0d;  /* the character grid background */
+      --canvas-fg:  #cccccc;  /* default character colour */
+      --hover-bg:   #1a2e1a;  /* cell hover tint */
+      --accent:     #4ec9b0;  /* active tool/palette highlight */
+    }
+
+    :root[data-theme="light"] {
+      --bg:         #e8e8e8;
+      --chrome:     #d0d0d0;
+      --border:     #aaa;
+      --text:       #1e1e1e;
+      --text-dim:   #555;
+      --canvas-bg:  #ffffff;
+      --canvas-fg:  #1e1e1e;
+      --hover-bg:   #d0ecd0;
+      --accent:     #007a6e;
+    }
+
+    /* ── Page layout ──────────────────────────────────────────────────────── */
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Menu bar ─────────────────────────────────────────────────────────── */
+    #menubar {
+      background: var(--chrome);
+      border-bottom: 1px solid var(--border);
+      padding: 4px 10px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 13px;
+      user-select: none;
+      flex-shrink: 0;
+    }
+    #menubar .brand {
+      font-weight: bold;
+      color: var(--accent);
+      padding: 2px 8px 2px 0;
+      margin-right: 4px;
+      border-right: 1px solid var(--border);
+    }
+    #menubar .menu-item {
+      cursor: pointer;
+      padding: 2px 8px;
+      border-radius: 3px;
+    }
+    #menubar .menu-item:hover { background: var(--border); }
+    #menubar .spacer { flex: 1; }
+
+    /* Undo / redo action buttons — styled as plain icon buttons, not text labels */
+    #menubar .menu-action {
+      cursor: pointer;
+      padding: 2px 7px;
+      border-radius: 3px;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    #menubar .menu-action:hover { background: var(--border); }
+
+    /* Thin vertical rule separating undo/redo from the File menu group */
+    #menubar .menu-sep {
+      width: 1px;
+      height: 16px;
+      background: var(--border);
+      margin: 0 4px;
+      flex-shrink: 0;
+    }
+
+    /* Theme toggle — label text ("☀ Light" / "☾ Dark") is set by Rust */
+    #theme-toggle {
+      cursor: pointer;
+      padding: 2px 10px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    #theme-toggle:hover { background: var(--border); }
+
+    /* ── Main area (toolbar + canvas) ────────────────────────────────────── */
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Toolbar ──────────────────────────────────────────────────────────── */
+    /* Static structure defined in HTML; click handlers wired by Rust.        */
+    #toolbar {
+      background: var(--chrome);
+      border-right: 1px solid var(--border);
+      width: 56px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 8px 0;
+      gap: 2px;
+      flex-shrink: 0;
+      user-select: none;
+    }
+    .tool-row { display: flex; gap: 2px; }
+
+    /* Individual tool button */
+    .tool {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 14px;
+      border: 1px solid transparent;
+      color: var(--text);
+    }
+    .tool:hover { background: var(--border); }
+    .tool.active {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
+    }
+
+    /* Horizontal divider between tool groups */
+    .tool-sep {
+      width: 40px;
+      height: 1px;
+      background: var(--border);
+      margin: 4px 0;
+    }
+
+    /* ── Canvas area ──────────────────────────────────────────────────────── */
+    #canvas-wrap {
+      flex: 1;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+      overflow: auto;
+      padding: 16px;
+      background: var(--bg);
+    }
+
+    /* ── Character grid ───────────────────────────────────────────────────── */
+    /* Cell <span> elements are created by Rust; layout is pure CSS.          */
+    /* grid-template-columns uses `ch` units so column width tracks the font. */
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(80, 1ch);
+      grid-auto-rows: 1.25em;
+      font-family: monospace;      /* system default monospace — TBD: user font picker */
+      font-size: 16px;
+      line-height: 1.25;
+      background: var(--canvas-bg);
+      color: var(--canvas-fg);
+      border: 1px solid var(--border);
+      cursor: crosshair;
+      user-select: none;
+      flex-shrink: 0;
+    }
+
+    /* Individual character cell */
+    .cell {
+      display: block;
+      overflow: hidden;
+      white-space: pre; /* preserve spaces; do not collapse or wrap */
+    }
+    .cell:hover  { background: var(--hover-bg); }
+
+    /* Preview state: cell is part of an in-progress tool operation */
+    .cell.preview {
+      background: color-mix(in srgb, var(--accent) 25%, transparent);
+      color: var(--accent);
+    }
+
+    /* ── Palette strip ────────────────────────────────────────────────────── */
+    /* Entries are created by Rust (build_palette); click handlers by Rust.   */
+    #palette {
+      background: var(--chrome);
+      border-top: 1px solid var(--border);
+      height: 52px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      gap: 4px;
+      flex-shrink: 0;
+      user-select: none;
+      overflow-x: auto;
+    }
+    .palette-label {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-right: 4px;
+      white-space: nowrap;
+    }
+
+    /* Individual palette character button */
+    .pal-char {
+      width: 30px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: monospace;
+      font-size: 16px;
+      background: var(--canvas-bg);
+      color: var(--canvas-fg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .pal-char:hover  { border-color: var(--text-dim); }
+    .pal-char.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+
+    /* Visual separator between palette groups */
+    .pal-sep {
+      width: 1px;
+      height: 34px;
+      background: var(--border);
+      margin: 0 4px;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Menu bar — static labels; TBD: menus wired by Rust -->
+  <div id="menubar">
+    <span class="brand">charpaint</span>
+    <!-- Undo / redo — click handlers and Ctrl+Z/Shift+Ctrl+Z wired by Rust -->
+    <button id="btn-undo" class="menu-action" title="Undo (Ctrl+Z)">↩</button>
+    <button id="btn-redo" class="menu-action" title="Redo (Shift+Ctrl+Z)">↪</button>
+    <span class="menu-sep"></span>
+    <span class="menu-item">File</span>
+    <span class="menu-item">Edit</span>
+    <span class="menu-item">View</span>
+    <span class="menu-item">Goodies</span>
+    <span class="spacer"></span>
+    <!-- Initial label "☀ Light" reflects current dark default; Rust toggles it -->
+    <button id="theme-toggle">☀ Light</button>
+  </div>
+
+  <div id="main">
+
+    <!-- Toolbar — icons and data-tool attrs defined here; click handlers wired by Rust -->
+    <div id="toolbar">
+      <div class="tool-row">
+        <div class="tool active" data-tool="pencil"    title="Pencil">✎</div>
+        <div class="tool"        data-tool="select"    title="Select">⬚</div>
+      </div>
+      <div class="tool-row">
+        <div class="tool" data-tool="fill"   title="Fill">▤</div>
+        <div class="tool" data-tool="text"   title="Text">A</div>
+      </div>
+      <div class="tool-sep"></div>
+      <div class="tool-row">
+        <div class="tool" data-tool="line"      title="Line">╲</div>
+        <div class="tool" data-tool="eraser"    title="Eraser">□</div>
+      </div>
+      <div class="tool-row">
+        <div class="tool" data-tool="rect"      title="Rectangle">▭</div>
+        <div class="tool" data-tool="rect-fill" title="Filled Rectangle">▬</div>
+      </div>
+      <div class="tool-row">
+        <div class="tool" data-tool="oval"      title="Oval">○</div>
+        <div class="tool" data-tool="oval-fill" title="Filled Oval">●</div>
+      </div>
+    </div>
+
+    <div id="canvas-wrap">
+      <!-- Grid cells are created programmatically by Rust (build_grid) -->
+      <div id="grid"></div>
+    </div>
+
+  </div>
+
+  <!-- Palette entries are created programmatically by Rust (build_palette) -->
+  <div id="palette"></div>
+
+  <script type="module">
+    // Minimal loader — all application logic is in the Rust/WASM module.
+    import init from './pkg/charpaint.js';
+    await init(); // triggers #[wasm_bindgen(start)] → App::start()
+  </script>
+
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(rustup target *)",
+      "Bash(rustup show *)",
+      "Read(//mnt/c/Users/Joseph/dev/**)",
+      "Bash(cargo init *)",
+      "PowerShell(python --version 2>&1)",
+      "PowerShell(python3 --version 2>&1)"
+    ]
+  }
+}

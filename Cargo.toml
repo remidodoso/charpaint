@@ -1,0 +1,33 @@
+[package]
+name = "charpaint"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+
+# Makes Rust panics appear in the browser console with a readable message.
+# Essential during development; harmless in production.
+console_error_panic_hook = "0.1"
+
+# Web platform APIs. Each feature flag enables one IDL interface.
+# Add new flags here as more browser APIs are needed.
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "console",       # web_sys::console::log_1 etc. for debug logging
+  "Document",      # get_element_by_id, create_element, query_selector_all
+  "Element",       # set_class_name, get/set_attribute, class_list, closest
+  "Event",         # prevent_default, target (inherited by MouseEvent)
+  "EventTarget",   # add_event_listener_with_callback (inherited by Element, Window)
+  "HtmlElement",   # general HtmlElement access
+  "MouseEvent",    # type for mouse event handlers
+  "Node",          # append_child, set_text_content
+  "NodeList",      # item(), length() — result of query_selector_all
+  "Window",        # web_sys::window(), .document()
+  "DomTokenList",  # class_list().add_1(), remove_1(), contains()
+  "KeyboardEvent", # keydown handler for Ctrl+Z / Shift+Ctrl+Z
+]

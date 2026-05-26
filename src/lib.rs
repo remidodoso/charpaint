@@ -13,7 +13,7 @@ mod util;
 use util::bresenham;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy, wire_touch};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -240,10 +240,18 @@ pub(crate) struct App {
     /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
     /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
     pub(crate) selection: Option<(usize, usize, usize, usize)>,
+
+    // ── Touch / pinch-zoom state ─────────────────────────────────────────────
+    grid_el:                          Element,      // #grid element — target for font-size changes
+    pub(crate) font_size:             f64,          // current grid font size in px (default 16)
+    pub(crate) is_two_finger:         bool,         // true while two touches are on screen
+    pub(crate) pinch_start_dist:      f64,          // finger separation when current pinch began
+    pub(crate) pinch_start_font_size: f64,          // font_size at the start of current pinch
+    pub(crate) pan_last_mid:          (f64, f64),   // last two-touch midpoint, for pan delta
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -261,6 +269,12 @@ impl App {
             line_mode:               LineMode::Character,
             line_mode_dropdown_open: false,
             selection: None,
+            grid_el,
+            font_size:             16.0,
+            is_two_finger:         false,
+            pinch_start_dist:      0.0,
+            pinch_start_font_size: 16.0,
+            pan_last_mid:          (0.0, 0.0),
         }
     }
 
@@ -651,6 +665,17 @@ impl App {
         }
         Some(out)
     }
+
+    // ── Touch / zoom ─────────────────────────────────────────────────────────
+
+    /// Set the grid font size, clamped to 8–48 px, and apply it to the DOM.
+    /// Called on every pinch-zoom touchmove frame.
+    pub(crate) fn set_font_size(&mut self, size: f64) {
+        self.font_size = size.max(8.0).min(48.0);
+        self.grid_el
+            .set_attribute("style", &format!("font-size: {}px", self.font_size))
+            .unwrap();
+    }
 }
 
 // ── DOM construction ─────────────────────────────────────────────────────────
@@ -936,7 +961,8 @@ pub fn start() {
     build_line_mode_control(&document);
 
     // Initialise shared application state (shared via Rc<RefCell> across closures)
-    let app = Rc::new(RefCell::new(App::new(cell_els)));
+    let grid_el = document.get_element_by_id("grid").unwrap();
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el)));
 
     // Populate the canvas with demo content to prove the pipeline end-to-end
     draw_demo(&mut app.borrow_mut());
@@ -950,4 +976,5 @@ pub fn start() {
     wire_blend_mode(&document, &app);
     wire_line_tool(&document, &app);
     wire_copy(&document, &app);
+    wire_touch(&document, &app);
 }

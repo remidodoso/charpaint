@@ -9,12 +9,12 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, KeyboardEvent, MouseEvent, NodeList, Window};
+use web_sys::{Document, Element, KeyboardEvent, MouseEvent, NodeList, TouchEvent, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{App, BlendMode, LineMode, Tool};
-use crate::util::{cell_from_mouse_event, flash_button, flash_button_error, wire_long_press};
+use crate::util::{cell_from_coords, cell_from_mouse_event, flash_button, flash_button_error, wire_long_press};
 
 /// Attach mouse handlers to `#grid` and a global mouseup handler to `window`.
 ///
@@ -563,6 +563,200 @@ pub fn wire_line_tool(document: &Document, app: &Rc<RefCell<App>>) {
         });
         window
             .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+}
+
+/// Wire single-finger drawing and two-finger pan/zoom to `#grid`.
+///
+/// One finger: mirrors the mouse handlers — touchstart/move/end map to
+/// mousedown/move/up and drive the same App painting methods.
+///
+/// Two fingers: any in-progress single-finger stroke is aborted; the gesture
+/// becomes pan + pinch-zoom. Midpoint movement scrolls `#canvas-wrap`;
+/// finger-spread change scales `#grid` font-size (clamped 8–48 px). Scroll
+/// is corrected each frame so the content under the pinch midpoint stays
+/// stationary as zoom changes.
+///
+/// After a two-finger gesture, drawing is suppressed until all fingers lift,
+/// preventing accidental strokes as the second finger leaves the screen.
+///
+/// CSS `touch-action: none` on `#grid` (set in index.html) tells the browser
+/// to skip its own scroll/zoom handling so these handlers receive every touch.
+pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
+    let grid_el = document.get_element_by_id("grid").unwrap();
+    let wrap_el = document.get_element_by_id("canvas-wrap").unwrap();
+
+    // ── touchstart ───────────────────────────────────────────────────────────
+    {
+        let app = Rc::clone(app);
+        let doc = document.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            let touches = e.touches();
+            match touches.length() {
+                1 => {
+                    let mut a = app.borrow_mut();
+                    if a.is_two_finger {
+                        // One finger touching down while recovering from a two-finger
+                        // gesture — suppress until the screen is fully clear.
+                        return;
+                    }
+                    let t = touches.get(0).unwrap();
+                    if let Some((col, row)) = cell_from_coords(
+                        t.client_x() as f64, t.client_y() as f64, &doc,
+                    ) {
+                        if a.tool != Tool::Select {
+                            a.push_undo_snapshot();
+                        }
+                        a.is_drawing        = true;
+                        a.draw_start        = Some((col, row));
+                        a.locked_axis       = None;
+                        a.last_painted_cell = None;
+                        a.paint_stroke_to(col, row, false);
+                    }
+                }
+                2 => {
+                    let mut a = app.borrow_mut();
+                    if a.is_drawing {
+                        a.abort_stroke(); // cancel any in-progress single-finger stroke
+                    }
+                    a.is_two_finger = true;
+                    let t0 = touches.get(0).unwrap();
+                    let t1 = touches.get(1).unwrap();
+                    let (x0, y0) = (t0.client_x() as f64, t0.client_y() as f64);
+                    let (x1, y1) = (t1.client_x() as f64, t1.client_y() as f64);
+                    let dx = x1 - x0;
+                    let dy = y1 - y0;
+                    a.pinch_start_dist      = (dx * dx + dy * dy).sqrt();
+                    a.pinch_start_font_size = a.font_size;
+                    a.pan_last_mid          = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                }
+                _ => {}
+            }
+        });
+        grid_el
+            .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
+    // ── touchmove ────────────────────────────────────────────────────────────
+    {
+        let app  = Rc::clone(app);
+        let doc  = document.clone();
+        let wrap = wrap_el.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            let touches = e.touches();
+            match touches.length() {
+                1 => {
+                    let mut a = app.borrow_mut();
+                    if !a.is_drawing { return; }
+                    let t = touches.get(0).unwrap();
+                    if let Some((col, row)) = cell_from_coords(
+                        t.client_x() as f64, t.client_y() as f64, &doc,
+                    ) {
+                        a.paint_stroke_to(col, row, false);
+                    }
+                }
+                2 => {
+                    let t0 = touches.get(0).unwrap();
+                    let t1 = touches.get(1).unwrap();
+                    let (x0, y0) = (t0.client_x() as f64, t0.client_y() as f64);
+                    let (x1, y1) = (t1.client_x() as f64, t1.client_y() as f64);
+                    let dx       = x1 - x0;
+                    let dy       = y1 - y0;
+                    let cur_dist = (dx * dx + dy * dy).sqrt();
+                    let mid_x    = (x0 + x1) / 2.0;
+                    let mid_y    = (y0 + y1) / 2.0;
+
+                    // Short immutable borrow: read pinch/pan state, compute deltas.
+                    let new_font: f64;
+                    let inc_scale: f64;
+                    let pan_dx: f64;
+                    let pan_dy: f64;
+                    {
+                        let a = app.borrow();
+                        if !a.is_two_finger { return; }
+                        let ratio = if a.pinch_start_dist > 0.0 {
+                            cur_dist / a.pinch_start_dist
+                        } else {
+                            1.0
+                        };
+                        new_font  = (a.pinch_start_font_size * ratio).max(8.0).min(48.0);
+                        inc_scale = new_font / a.font_size; // incremental scale this frame
+                        pan_dx    = mid_x - a.pan_last_mid.0;
+                        pan_dy    = mid_y - a.pan_last_mid.1;
+                    }
+
+                    // Scroll correction: keep the content point under the pinch midpoint
+                    // stationary as zoom changes, then shift by the pan delta.
+                    // mid_vp = midpoint relative to canvas-wrap's top-left corner.
+                    let wrap_rect = wrap.get_bounding_client_rect();
+                    let mid_vp_x  = mid_x - wrap_rect.left();
+                    let mid_vp_y  = mid_y - wrap_rect.top();
+                    let old_sl    = wrap.scroll_left() as f64;
+                    let old_st    = wrap.scroll_top()  as f64;
+                    let new_sl = (old_sl * inc_scale + mid_vp_x * (inc_scale - 1.0) - pan_dx).max(0.0);
+                    let new_st = (old_st * inc_scale + mid_vp_y * (inc_scale - 1.0) - pan_dy).max(0.0);
+
+                    {
+                        let mut a = app.borrow_mut();
+                        a.set_font_size(new_font);
+                        a.pan_last_mid = (mid_x, mid_y);
+                    }
+
+                    wrap.set_scroll_left(new_sl.round() as i32);
+                    wrap.set_scroll_top(new_st.round()  as i32);
+                }
+                _ => {}
+            }
+        });
+        grid_el
+            .add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
+    // ── touchend ─────────────────────────────────────────────────────────────
+    // On window so releases anywhere on the page are caught, consistent with
+    // how the mouse-up handler is wired.
+    {
+        let window = web_sys::window().unwrap();
+        let app    = Rc::clone(app);
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            if e.touches().length() == 0 {
+                // All fingers off — commit any stroke and exit two-finger guard.
+                let mut a = app.borrow_mut();
+                if a.is_drawing {
+                    a.commit_stroke();
+                }
+                a.is_two_finger = false;
+            }
+            // One finger remaining after two-finger gesture: keep is_two_finger
+            // true so the lingering finger doesn't accidentally start a stroke.
+        });
+        window
+            .add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
+    // ── touchcancel ──────────────────────────────────────────────────────────
+    // Fired when the OS interrupts a touch (incoming call, system gesture, etc.).
+    // Abort rather than commit so the interrupted stroke doesn't pollute the canvas.
+    {
+        let window = web_sys::window().unwrap();
+        let app    = Rc::clone(app);
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            let mut a = app.borrow_mut();
+            if a.is_drawing {
+                a.abort_stroke();
+            }
+            a.is_two_finger = false;
+        });
+        window
+            .add_event_listener_with_callback("touchcancel", cb.as_ref().unchecked_ref())
             .unwrap();
         cb.forget();
     }

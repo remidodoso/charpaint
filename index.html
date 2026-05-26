@@ -254,6 +254,7 @@
       border: 1px solid var(--border);
       cursor: crosshair;
       user-select: none;
+      touch-action: none; /* hand all touch events to JS; prevents browser scroll/zoom on the canvas */
       flex-shrink: 0;
     }
 

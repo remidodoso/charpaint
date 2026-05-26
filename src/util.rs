@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Element, MouseEvent};
+use web_sys::{Document, Element, MouseEvent};
 
 // ── Bresenham's line algorithm ────────────────────────────────────────────────
 
@@ -48,6 +48,21 @@ pub fn cell_from_mouse_event(e: &MouseEvent) -> Option<(usize, usize)> {
         target.closest(".cell").ok()??
     };
 
+    let col: usize = cell_el.get_attribute("data-col")?.parse().ok()?;
+    let row: usize = cell_el.get_attribute("data-row")?.parse().ok()?;
+    Some((col, row))
+}
+
+/// Find the grid cell at viewport coordinates `(x, y)` using the live DOM.
+/// Used by touch handlers where no MouseEvent is available.
+/// Mirrors `cell_from_mouse_event` but accepts raw coordinates.
+pub fn cell_from_coords(x: f64, y: f64, document: &Document) -> Option<(usize, usize)> {
+    let el = document.element_from_point(x as f32, y as f32)?;
+    let cell_el = if el.class_list().contains("cell") {
+        el
+    } else {
+        el.closest(".cell").ok()??
+    };
     let col: usize = cell_el.get_attribute("data-col")?.parse().ok()?;
     let row: usize = cell_el.get_attribute("data-row")?.parse().ok()?;
     Some((col, row))

@@ -37,4 +37,8 @@ features = [
   "Window",        # web_sys::window(), .document()
   "DomTokenList",  # class_list().add_1(), remove_1(), contains()
   "KeyboardEvent", # keydown handler for Ctrl+Z / Shift+Ctrl+Z
+  "TouchEvent",    # type for touch event handlers
+  "Touch",         # individual touch point within a TouchEvent
+  "TouchList",     # collection of Touch objects (e.touches(), etc.)
+  "DomRect",       # bounding rect returned by getBoundingClientRect — used for pinch-zoom scroll correction
 ]

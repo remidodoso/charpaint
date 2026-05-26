@@ -13,7 +13,7 @@ mod util;
 use util::bresenham;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_copy};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -57,6 +57,32 @@ impl BlendMode {
     }
 }
 
+// ── LineMode ─────────────────────────────────────────────────────────────────
+
+/// Whether the line tool stamps the brush character or chooses - | \ / based on direction.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum LineMode {
+    Character, // stamp brush_char along the Bresenham path — simple, any character
+    Art,       // select - | \ / per step direction — classic ASCII-art geometry
+}
+
+impl LineMode {
+    pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
+        match s {
+            "character" => Some(LineMode::Character),
+            "art"       => Some(LineMode::Art),
+            _           => None,
+        }
+    }
+
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            LineMode::Character => "╲",
+            LineMode::Art       => "📐",
+        }
+    }
+}
+
 // ── Axis ─────────────────────────────────────────────────────────────────────
 
 /// Constraint axis for Shift-locked drawing. Once determined for a stroke,
@@ -79,7 +105,7 @@ pub(crate) enum Tool {
     Line,     // NIY — will use brush char or directional chars (─ │ ╲ ╱)
     Rect,     // NIY — hollow rectangle, style driven by palette selection
     RectFill, // NIY — filled rectangle
-    Oval,     // NIY
+    Oval,
     OvalFill, // NIY
 }
 
@@ -208,6 +234,8 @@ pub(crate) struct App {
     pub(crate) dark_mode: bool,
     pub(crate) blend_mode:         BlendMode, // how new paint interacts with existing cells
     pub(crate) mode_dropdown_open: bool,      // true while the blend mode fly-out is visible
+    pub(crate) line_mode:               LineMode, // character-stamp vs art-geometry line drawing
+    pub(crate) line_mode_dropdown_open: bool,     // true while the line mode fly-out is visible
 
     /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
     /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
@@ -230,6 +258,8 @@ impl App {
             dark_mode:  true,
             blend_mode:         BlendMode::Overwrite,
             mode_dropdown_open: false,
+            line_mode:               LineMode::Character,
+            line_mode_dropdown_open: false,
             selection: None,
         }
     }
@@ -359,13 +389,36 @@ impl App {
                     self.render_cell(c, r);
                 }
                 if let Some((sc, sr)) = self.draw_start {
-                    for (c, r) in bresenham(sc, sr, col, row) {
+                    let cells = bresenham(sc, sr, col, row);
+                    // Overall direction used to characterise the first cell in art mode.
+                    let overall_dc = (col as i32) - (sc as i32);
+                    let overall_dr = (row as i32) - (sr as i32);
+                    for (i, &(c, r)) in cells.iter().enumerate() {
+                        let ch = match self.line_mode {
+                            LineMode::Character => self.brush_char,
+                            LineMode::Art => {
+                                if i == 0 {
+                                    // Use the step to the next cell so the start character
+                                    // matches the local direction, not the overall slope.
+                                    // Falls back to overall direction for single-cell lines.
+                                    if cells.len() > 1 {
+                                        let (nc, nr) = cells[1];
+                                        art_char((nc as i32) - (c as i32), (nr as i32) - (r as i32))
+                                    } else {
+                                        art_char(overall_dc, overall_dr)
+                                    }
+                                } else {
+                                    let (pc, pr) = cells[i - 1];
+                                    art_char((c as i32) - (pc as i32), (r as i32) - (pr as i32))
+                                }
+                            }
+                        };
                         if self.blend_mode == BlendMode::Stamp
                             && self.grid.committed[Grid::idx(c, r)] != BLANK
                         {
                             continue;
                         }
-                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.grid.set_preview(c, r, Some(ch));
                         self.render_cell(c, r);
                     }
                 }
@@ -422,6 +475,27 @@ impl App {
                             self.grid.set_preview(c, r, Some(self.brush_char));
                             self.render_cell(c, r);
                         }
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Oval => {
+                // Clear previous preview, then redraw the ellipse inscribed in the
+                // bounding box from draw_start to the current cell.
+                let dirty = self.grid.abort_preview();
+                for (c, r) in dirty {
+                    self.render_cell(c, r);
+                }
+                if let Some((sc, sr)) = self.draw_start {
+                    for (c, r) in ellipse_cells(sc, sr, col, row) {
+                        if self.blend_mode == BlendMode::Stamp
+                            && self.grid.committed[Grid::idx(c, r)] != BLANK
+                        {
+                            continue;
+                        }
+                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.render_cell(c, r);
                     }
                 }
                 self.last_painted_cell = Some((col, row));
@@ -705,6 +779,113 @@ fn build_blend_mode_control(document: &Document) {
     toolbar.append_child(&dropdown).unwrap();
 }
 
+/// Return every (col, row) on the ellipse outline inscribed in bounding box
+/// (bx0,by0)–(bx1,by1), using the Zingl-Bresenham integer algorithm.
+/// No floating point or trig. Handles even/odd dimensions and degenerate
+/// cases (single cell, horizontal/vertical line).
+fn ellipse_cells(bx0: usize, by0: usize, bx1: usize, by1: usize) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+
+    let (mut x0, mut y0) = (bx0 as i64, by0 as i64);
+    let (mut x1, mut y1) = (bx1 as i64, by1 as i64);
+
+    if x0 > x1 { std::mem::swap(&mut x0, &mut x1); }
+    if y0 > y1 { std::mem::swap(&mut y0, &mut y1); }
+
+    let a = x1 - x0;   // full horizontal span
+    let b = y1 - y0;   // full vertical span
+    let b_odd = b & 1; // 1 if height is odd — affects midline placement
+
+    let mut dx = 4 * (1 - a) * b * b;
+    let mut dy = 4 * (b_odd + 1) * a * a;
+    let mut err = dx + dy + b_odd * a * a;
+
+    y0 += (b + 1) / 2; // advance y0 to the horizontal midline
+    y1  = y0 - b_odd;
+
+    let da = 8 * a * a; // added to dx each time a y step occurs
+    let db = 8 * b * b; // added to dy each time an x step occurs
+
+    // Inline bounds-checked push; defined as a macro to avoid closure borrow conflicts.
+    macro_rules! push {
+        ($px:expr, $py:expr) => {{
+            let (px, py): (i64, i64) = ($px, $py);
+            if px >= 0 && py >= 0 && (px as usize) < COLS && (py as usize) < ROWS {
+                cells.push((px as usize, py as usize));
+            }
+        }};
+    }
+
+    // Main loop: x marches inward; y steps outward as the error term demands.
+    // Four symmetric points are plotted each iteration (one per quadrant).
+    loop {
+        push!(x1, y0); // right, upper half
+        push!(x0, y0); // left,  upper half
+        push!(x0, y1); // left,  lower half
+        push!(x1, y1); // right, lower half
+
+        let e2 = 2 * err;
+        if e2 <= dy                  { y0 += 1; y1 -= 1; dy += da; err += dy; }
+        if e2 >= dx || 2 * err > dy  { x0 += 1; x1 -= 1; dx += db; err += dx; }
+
+        if x0 > x1 { break; }
+    }
+
+    // Flat-ellipse correction: for very wide/short ellipses the main loop can
+    // exit before the vertical tips are fully drawn; fill them in here.
+    while y0 - y1 <= b {
+        push!(x0 - 1, y0);
+        push!(x1 + 1, y0); y0 += 1;
+        push!(x0 - 1, y1);
+        push!(x1 + 1, y1); y1 -= 1;
+    }
+
+    cells
+}
+
+/// Map a Bresenham step direction vector to the ASCII art character that best
+/// represents it. Covers all four axis-aligned and diagonal cases.
+fn art_char(dc: i32, dr: i32) -> char {
+    match (dc.signum(), dr.signum()) {
+        (1, 0) | (-1, 0)  => '-',
+        (0, 1) | (0, -1)  => '|',
+        (1, 1) | (-1, -1) => '\\',
+        _                  => '/',
+    }
+}
+
+/// Create the `#line-mode-dropdown` fly-out and append it to the `.tool-row`
+/// that contains `#line-tool-btn`. Anchoring to the row (not the toolbar root)
+/// makes `left: 100%; top: 0` position the fly-out beside that specific row.
+fn build_line_mode_control(document: &Document) {
+    let line_btn = document
+        .get_element_by_id("line-tool-btn")
+        .expect("#line-tool-btn must exist in HTML");
+    let toolbar = line_btn
+        .parent_element()
+        .expect("#line-tool-btn must have a parent element");
+
+    let dropdown = document.create_element("div").unwrap();
+    dropdown.set_attribute("id", "line-mode-dropdown").unwrap();
+
+    // Character mode starts selected (matches App default).
+    let modes: &[(&str, &str, &str, bool)] = &[
+        ("character", "╲",  "Character — stamp brush char along path", true),
+        ("art",       "📐", "Art — use - | \\ / for geometry",          false),
+    ];
+
+    for &(mode_id, icon, title, initially_selected) in modes {
+        let tile = document.create_element("div").unwrap();
+        tile.set_class_name(if initially_selected { "mode-tile selected" } else { "mode-tile" });
+        tile.set_attribute("data-line-mode", mode_id).unwrap();
+        tile.set_attribute("title", title).unwrap();
+        tile.set_text_content(Some(icon));
+        dropdown.append_child(&tile).unwrap();
+    }
+
+    toolbar.append_child(&dropdown).unwrap();
+}
+
 // ── Demo content ─────────────────────────────────────────────────────────────
 
 /// Draw a border and greeting to prove the Rust→DOM rendering pipeline works.
@@ -752,6 +933,7 @@ pub fn start() {
     let cell_els = build_grid(&document);
     build_palette(&document);
     build_blend_mode_control(&document);
+    build_line_mode_control(&document);
 
     // Initialise shared application state (shared via Rc<RefCell> across closures)
     let app = Rc::new(RefCell::new(App::new(cell_els)));
@@ -766,5 +948,6 @@ pub fn start() {
     wire_undo_redo(&document, &app);
     wire_theme_toggle(&document, &app);
     wire_blend_mode(&document, &app);
+    wire_line_tool(&document, &app);
     wire_copy(&document, &app);
 }

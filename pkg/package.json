@@ -1,0 +1,15 @@
+{
+  "name": "charpaint",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "charpaint_bg.wasm",
+    "charpaint.js",
+    "charpaint.d.ts"
+  ],
+  "main": "charpaint.js",
+  "types": "charpaint.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

@@ -150,7 +150,7 @@
       user-select: none;
       position: relative; /* anchors #mode-dropdown absolute positioning */
     }
-    .tool-row { display: flex; gap: 2px; }
+    .tool-row { display: flex; gap: 2px; position: relative; } /* relative so child dropdowns anchor here */
 
     /* Individual tool button */
     .tool {
@@ -190,8 +190,9 @@
       pointer-events: none;
     }
 
-    /* Blend mode fly-out — floats to the right of the toolbar, anchored to its top */
-    #mode-dropdown {
+    /* Tool fly-out dropdowns — float to the right of the toolbar, anchored to its top.
+       Only one is ever open at a time so shared positioning is fine. */
+    #mode-dropdown, #line-mode-dropdown {
       position: absolute;
       left: 100%;     /* flush with the toolbar's right edge */
       top: 0;
@@ -205,7 +206,7 @@
       z-index: 100;
       box-shadow: 2px 4px 8px rgba(0,0,0,0.4);
     }
-    #mode-dropdown.open { display: flex; }
+    #mode-dropdown.open, #line-mode-dropdown.open { display: flex; }
 
     /* Individual tile inside the blend mode dropdown */
     .mode-tile {
@@ -368,7 +369,7 @@
       </div>
       <div class="tool-sep"></div>
       <div class="tool-row">
-        <div class="tool" data-tool="line"      title="Line">╲</div>
+        <div class="tool" id="line-tool-btn" data-tool="line" title="Line — hold for mode">╲</div>
         <div class="tool" data-tool="eraser"    title="Eraser">□</div>
       </div>
       <div class="tool-row">

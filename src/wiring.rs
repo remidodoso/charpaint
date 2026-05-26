@@ -13,8 +13,8 @@ use web_sys::{Document, Element, KeyboardEvent, MouseEvent, NodeList, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
-use crate::{App, BlendMode, Tool};
-use crate::util::{cell_from_mouse_event, flash_button, flash_button_error};
+use crate::{App, BlendMode, LineMode, Tool};
+use crate::util::{cell_from_mouse_event, flash_button, flash_button_error, wire_long_press};
 
 /// Attach mouse handlers to `#grid` and a global mouseup handler to `window`.
 ///
@@ -103,6 +103,9 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
             Some(t) => t,
             None => continue,
         };
+
+        // Line tool has sub-modes and uses long-press; wired separately by wire_line_tool.
+        if tool == Tool::Line { continue; }
 
         let app       = Rc::clone(app);
         let el_clone  = el.clone();
@@ -338,8 +341,9 @@ pub fn wire_blend_mode(document: &Document, app: &Rc<RefCell<App>>) {
                         .unwrap();
                     }
 
-                    // Move `selected` highlight to the newly chosen tile
-                    let tiles = doc_clone.query_selector_all(".mode-tile").unwrap();
+                    // Move `selected` highlight to the newly chosen blend mode tile.
+                    // Scoped to [data-mode] so line-mode tiles are not affected.
+                    let tiles = doc_clone.query_selector_all("[data-mode]").unwrap();
                     for i in 0..tiles.length() {
                         let t: Element = tiles.item(i).unwrap().dyn_into().unwrap();
                         t.class_list().remove_1("selected").unwrap();
@@ -448,6 +452,118 @@ pub fn wire_copy(document: &Document, app: &Rc<RefCell<App>>) {
             }
         });
         window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Wire the line mode fly-out (╲ / 📐 tile in the toolbar).
+/// Wire the line tool button with long-press mode selection.
+/// Quick click → activate Tool::Line. Hold 400ms → open the line mode fly-out.
+/// Window mouseup commits the chosen mode tile and updates the button icon.
+pub fn wire_line_tool(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("line-tool-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    let app_click = Rc::clone(app);
+    let app_lp    = Rc::clone(app);
+    let doc_click = document.clone();
+    let doc_lp    = document.clone();
+    let btn_click = btn.clone();
+
+    wire_long_press(
+        &btn,
+        // on_click: activate the line tool, move .active class
+        move || {
+            {
+                let mut a = app_click.borrow_mut();
+                a.clear_selection();
+                a.tool = Tool::Line;
+            }
+            let all = doc_click.query_selector_all(".tool").unwrap();
+            for j in 0..all.length() {
+                let t: Element = all.item(j).unwrap().dyn_into().unwrap();
+                t.class_list().remove_1("active").unwrap();
+            }
+            btn_click.class_list().add_1("active").unwrap();
+        },
+        // on_long_press: open the mode fly-out
+        move || {
+            app_lp.borrow_mut().line_mode_dropdown_open = true;
+            if let Some(dd) = doc_lp.get_element_by_id("line-mode-dropdown") {
+                dd.class_list().add_1("open").unwrap();
+            }
+        },
+    );
+
+    // window mouseup → close dropdown and commit the chosen mode tile.
+    // If the user released over a tile: set mode, activate line tool, update icon.
+    // If the user dragged off without landing on a tile: dismiss without activating.
+    {
+        let window    = web_sys::window().unwrap();
+        let app       = Rc::clone(app);
+        let doc_clone = document.clone();
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            {
+                let mut a = app.borrow_mut();
+                if !a.line_mode_dropdown_open { return; }
+                a.line_mode_dropdown_open = false;
+            } // release borrow before DOM work
+
+            if let Some(dd) = doc_clone.get_element_by_id("line-mode-dropdown") {
+                dd.class_list().remove_1("open").unwrap();
+            }
+
+            let target: Option<Element> = e.target().and_then(|t| t.dyn_into().ok());
+            let tile = target.and_then(|el| {
+                if el.get_attribute("data-line-mode").is_some() {
+                    Some(el)
+                } else {
+                    el.closest("[data-line-mode]").ok().flatten()
+                }
+            });
+
+            if let Some(tile_el) = tile {
+                let mode_str = tile_el.get_attribute("data-line-mode").unwrap_or_default();
+                if let Some(mode) = LineMode::from_data_attr(&mode_str) {
+                    // Commit mode and activate the line tool (long-press + tile = tool select).
+                    {
+                        let mut a = app.borrow_mut();
+                        a.line_mode = mode;
+                        a.clear_selection();
+                        a.tool = Tool::Line;
+                    }
+
+                    // Move .active to the line tool button
+                    let all = doc_clone.query_selector_all(".tool").unwrap();
+                    for i in 0..all.length() {
+                        let t: Element = all.item(i).unwrap().dyn_into().unwrap();
+                        t.class_list().remove_1("active").unwrap();
+                    }
+                    btn_clone.class_list().add_1("active").unwrap();
+
+                    // Update button icon and title to reflect the chosen mode
+                    btn_clone.set_text_content(Some(mode.icon()));
+                    btn_clone
+                        .set_attribute("title", &format!("Line ({}) — hold for mode", mode.icon()))
+                        .unwrap();
+
+                    // Move `selected` highlight to the chosen tile
+                    let tiles = doc_clone.query_selector_all("[data-line-mode]").unwrap();
+                    for i in 0..tiles.length() {
+                        let t: Element = tiles.item(i).unwrap().dyn_into().unwrap();
+                        t.class_list().remove_1("selected").unwrap();
+                    }
+                    tile_el.class_list().add_1("selected").unwrap();
+                }
+            }
+            // No tile → user dragged off without selecting; line tool stays inactive.
+        });
+        window
+            .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
+            .unwrap();
         cb.forget();
     }
 }

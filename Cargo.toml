@@ -9,6 +9,13 @@ crate-type = ["cdylib"]
 [dependencies]
 wasm-bindgen = "0.2"
 
+# Bridges Rust async/await to JS Promises — used for the clipboard write API.
+wasm-bindgen-futures = "0.4"
+
+# Raw JS type bindings (Object, Function, Promise, Reflect, etc.).
+# Used for calling browser APIs not yet wrapped by web-sys (e.g. navigator.clipboard).
+js-sys = "0.3"
+
 # Makes Rust panics appear in the browser console with a readable message.
 # Essential during development; harmless in production.
 console_error_panic_hook = "0.1"

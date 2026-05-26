@@ -6,13 +6,16 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, KeyboardEvent, MouseEvent, NodeList, Window};
+use web_sys::{Document, Element, Window};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+mod util;
+use util::bresenham;
+
+mod wiring;
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_copy};
+
+// ── Constants ────────────────────────────────────────────────────────────────
 
 const COLS: usize = 80;
 const ROWS: usize = 24;
@@ -20,13 +23,54 @@ const ROWS: usize = 24;
 /// The character placed in a cell when it is blank / erased.
 const BLANK: char = ' ';
 
-// ── Tool ──────────────────────────────────────────────────────────────────────
+// ── BlendMode ────────────────────────────────────────────────────────────────
+
+/// How the brush interacts with cells that already contain content.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum BlendMode {
+    Overwrite,  // replace any cell unconditionally — classic paint behaviour
+    Stamp,      // only write into blank cells; occupied cells are left untouched
+    Combine,    // NIY — set-union of glyphs (TBD: exact visual definition)
+    Difference, // NIY — set-difference / punch-out mode
+}
+
+impl BlendMode {
+    /// HTML `data-mode` attribute string → BlendMode variant.
+    pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
+        match s {
+            "overwrite"  => Some(BlendMode::Overwrite),
+            "stamp"      => Some(BlendMode::Stamp),
+            "combine"    => Some(BlendMode::Combine),
+            "difference" => Some(BlendMode::Difference),
+            _            => None,
+        }
+    }
+
+    /// Unicode icon for the mode, displayed in the mode-button tile.
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            BlendMode::Overwrite  => "▊",
+            BlendMode::Stamp      => "⬚",
+            BlendMode::Combine    => "┼",
+            BlendMode::Difference => "∖",
+        }
+    }
+}
+
+// ── Axis ─────────────────────────────────────────────────────────────────────
+
+/// Constraint axis for Shift-locked drawing. Once determined for a stroke,
+/// never changes — releasing Shift mid-stroke does not un-constrain.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Axis { Horizontal, Vertical }
+
+// ── Tool ─────────────────────────────────────────────────────────────────────
 
 /// Every tool the toolbar can activate.
 /// Variants marked NIY are declared so the data model is complete but their
 /// drawing logic is not yet implemented — they will no-op gracefully.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Tool {
+pub(crate) enum Tool {
     Pencil,
     Eraser,
     Select,   // NIY
@@ -41,7 +85,7 @@ enum Tool {
 
 impl Tool {
     /// Map the `data-tool` HTML attribute value to a Tool variant.
-    fn from_data_attr(s: &str) -> Option<Self> {
+    pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
         match s {
             "pencil"    => Some(Tool::Pencil),
             "eraser"    => Some(Tool::Eraser),
@@ -58,14 +102,13 @@ impl Tool {
     }
 }
 
-// ── Grid ──────────────────────────────────────────────────────────────────────
+// ── Grid ─────────────────────────────────────────────────────────────────────
 
 /// The character canvas: a committed backing store plus an ephemeral preview
 /// layer for showing in-progress tool operations before mouseup.
 struct Grid {
     /// Authoritative canvas state. Each undo snapshot is a clone of this vec.
     committed: Vec<char>,
-
     /// Per-cell override shown while a tool drag is in progress.
     /// `None` means "fall through to the committed value."
     /// Cleared on mouseup (commit) or ESC (abort).
@@ -129,25 +172,28 @@ impl Grid {
     }
 }
 
-// ── Application state ─────────────────────────────────────────────────────────
+// ── Application state ────────────────────────────────────────────────────────
 
-struct App {
+pub(crate) struct App {
     grid: Grid,
-
     /// Flat list of DOM `<span class="cell">` elements, one per grid cell,
     /// indexed `[row * COLS + col]`. Stored here to avoid repeated getElementById
     /// lookups — rendering just writes directly into these elements.
     cell_els: Vec<Element>,
 
-    tool:       Tool,
-    brush_char: char, // character the pencil/fill paints with
-
-    is_drawing: bool,
-
+    pub(crate) tool:       Tool,
+    pub(crate) brush_char: char, // character the pencil/fill paints with
+    pub(crate) is_drawing: bool,
+    /// Cell where the current stroke began. Used for Shift-axis projection and,
+    /// eventually, for preview-based tools (line, rect, oval).
+    pub(crate) draw_start: Option<(usize, usize)>,
+    /// Axis locked by Shift-constrain. Determined on first significant movement
+    /// under Shift; persists even if Shift is released before mouseup.
+    pub(crate) locked_axis: Option<Axis>,
     /// Last cell painted during the current stroke, used by Bresenham interpolation
     /// to fill gaps when the mouse moves faster than mousemove events fire.
     /// Cleared on mouseup / mousedown start.
-    last_painted_cell: Option<(usize, usize)>,
+    pub(crate) last_painted_cell: Option<(usize, usize)>,
 
     // TBD: draw_start: Option<(usize, usize)> — needed by line/rect/oval tools
     //      to remember where the drag began so preview can be redrawn on each
@@ -155,12 +201,17 @@ struct App {
 
     /// Undo history — each entry is a full snapshot of `grid.committed`.
     /// Pushed on every mouseup commit. Cheap: 80×24×4 B ≈ 7.5 KB per entry.
-    undo_stack: Vec<Vec<char>>, // TBD: wire to Ctrl+Z
-
+    undo_stack: Vec<Vec<char>>,
     /// States available for redo. Populated by undo(); cleared by new commits.
-    redo_stack: Vec<Vec<char>>, // TBD: wire to Ctrl+Y / Ctrl+Shift+Z
+    redo_stack: Vec<Vec<char>>,
 
-    dark_mode: bool,
+    pub(crate) dark_mode: bool,
+    pub(crate) blend_mode:         BlendMode, // how new paint interacts with existing cells
+    pub(crate) mode_dropdown_open: bool,      // true while the blend mode fly-out is visible
+
+    /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
+    /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
+    pub(crate) selection: Option<(usize, usize, usize, usize)>,
 }
 
 impl App {
@@ -171,21 +222,37 @@ impl App {
             tool:       Tool::Pencil,
             brush_char: '*',
             is_drawing: false,
+            draw_start:  None,
+            locked_axis: None,
             last_painted_cell: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             dark_mode:  true,
+            blend_mode:         BlendMode::Overwrite,
+            mode_dropdown_open: false,
+            selection: None,
         }
     }
 
-    // ── Rendering ─────────────────────────────────────────────────────────────
+    // ── Rendering ────────────────────────────────────────────────────────────
 
-    /// Push the current display character for one cell to its DOM element.
+    /// Push the current display character for one cell to its DOM element,
+    /// and toggle the `.preview` CSS class to show the in-progress tint.
     fn render_cell(&self, col: usize, row: usize) {
-        let ch = self.grid.display_char(col, row);
+        let idx = Grid::idx(col, row);
+        let el  = &self.cell_els[idx];
+        let ch  = self.grid.display_char(col, row);
+
         // Space must not be HTML-collapsed; CSS `white-space: pre` on .cell handles this.
-        self.cell_els[Grid::idx(col, row)]
-            .set_text_content(Some(&ch.to_string()));
+        el.set_text_content(Some(&ch.to_string()));
+
+        // Preview tint: add class while cell has an uncommitted in-progress value.
+        let cl = el.class_list();
+        if self.grid.preview[idx].is_some() {
+            cl.add_1("preview").unwrap();
+        } else {
+            cl.remove_1("preview").unwrap();
+        }
     }
 
     /// Re-render the entire grid — used after undo/redo or a full state restore.
@@ -197,7 +264,7 @@ impl App {
         }
     }
 
-    // ── Painting ──────────────────────────────────────────────────────────────
+    // ── Painting ─────────────────────────────────────────────────────────────
 
     /// Stamp a single character into the committed grid and update its DOM cell.
     fn paint_cell(&mut self, col: usize, row: usize, ch: char) {
@@ -205,44 +272,217 @@ impl App {
         self.render_cell(col, row);
     }
 
-    /// Paint a continuous stroke from `last_painted_cell` to (col, row).
-    ///
-    /// Uses Bresenham's line algorithm to fill any cells skipped when the mouse
-    /// moves faster than mousemove events fire. On the first call of a stroke
-    /// (last_painted_cell is None) only the target cell is painted.
-    ///
-    /// For multi-cell preview tools (line, rect, oval) this will instead write
-    /// to the preview layer — NIY for those tools.
-    fn paint_stroke_to(&mut self, col: usize, row: usize) {
-        let ch = match self.tool {
-            Tool::Pencil => self.brush_char,
-            Tool::Eraser => BLANK,
-            _ => return, // NIY tools are silent no-ops for now
-        };
-
-        let cells = match self.last_painted_cell {
-            Some((pc, pr)) => bresenham(pc, pr, col, row),
-            None            => vec![(col, row)],
-        };
-
-        for (c, r) in cells {
-            self.paint_cell(c, r, ch);
+    /// Clear all preview cells and re-render them without aborting the stroke.
+    /// Also resets `last_painted_cell` to `draw_start` so the very next Bresenham
+    /// call redraws a clean constrained line from the stroke origin forward.
+    fn clear_preview_for_snap(&mut self) {
+        let dirty = self.grid.abort_preview();
+        for (c, r) in dirty {
+            self.render_cell(c, r);
         }
-
-        self.last_painted_cell = Some((col, row));
+        self.last_painted_cell = self.draw_start; // Bresenham restarts from origin
     }
 
-    // ── Undo / redo ───────────────────────────────────────────────────────────
+    /// Resolve the actual target cell for a paint step, applying Shift constraint.
+    ///
+    /// If the axis is already locked, project onto it regardless of current Shift state.
+    /// If Shift is newly held, compare dx/dy from draw_start to determine the axis;
+    /// on first lock, snap the existing preview retroactively to a clean straight line.
+    /// Ties (dx == dy) defer locking until one axis pulls ahead.
+    fn resolve_target(&mut self, col: usize, row: usize, shift_held: bool) -> (usize, usize) {
+        let start = match self.draw_start {
+            Some(s) => s,
+            None    => return (col, row),
+        };
+
+        // Already locked — project regardless of whether Shift is still held.
+        if let Some(axis) = self.locked_axis {
+            return match axis {
+                Axis::Horizontal => (col,     start.1),
+                Axis::Vertical   => (start.0, row),
+            };
+        }
+
+        // Not yet locked — try to determine axis if Shift is held.
+        if shift_held {
+            let dx = col.abs_diff(start.0);
+            let dy = row.abs_diff(start.1);
+            if dx > dy {
+                self.locked_axis = Some(Axis::Horizontal);
+                self.clear_preview_for_snap(); // retroactively snap preview to clean line
+                return (col, start.1);
+            } else if dy > dx {
+                self.locked_axis = Some(Axis::Vertical);
+                self.clear_preview_for_snap();
+                return (start.0, row);
+            }
+            // Tie: keep evaluating on next move, continue freehand for now
+        }
+
+        (col, row)
+    }
+
+    /// Paint into the **preview layer** for the current tool and mouse position.
+    /// On mouseup the preview is committed; on ESC it is discarded.
+    ///
+    /// Pencil/Eraser: incremental — Bresenham from last position to current.
+    /// Line: redraws from draw_start to current on every call so the preview
+    ///       always shows exactly the final line, not a smear of all positions.
+    pub(crate) fn paint_stroke_to(&mut self, col: usize, row: usize, shift_held: bool) {
+        match self.tool {
+            Tool::Pencil | Tool::Eraser => {
+                let ch = if self.tool == Tool::Pencil { self.brush_char } else { BLANK };
+                let (col, row) = self.resolve_target(col, row, shift_held);
+                let cells = match self.last_painted_cell {
+                    Some((pc, pr)) => bresenham(pc, pr, col, row),
+                    None           => vec![(col, row)],
+                };
+                for (c, r) in cells {
+                    // Stamp: only paint blank cells; test committed so earlier preview
+                    // cells in this stroke don't shadow the check.
+                    if self.blend_mode == BlendMode::Stamp
+                        && self.grid.committed[Grid::idx(c, r)] != BLANK
+                    {
+                        continue;
+                    }
+                    self.grid.set_preview(c, r, Some(ch));
+                    self.render_cell(c, r);
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Line => {
+                // Clear the previous preview and redraw the whole line from
+                // draw_start to the current cursor position each mousemove.
+                let dirty = self.grid.abort_preview();
+                for (c, r) in dirty {
+                    self.render_cell(c, r);
+                }
+                if let Some((sc, sr)) = self.draw_start {
+                    for (c, r) in bresenham(sc, sr, col, row) {
+                        if self.blend_mode == BlendMode::Stamp
+                            && self.grid.committed[Grid::idx(c, r)] != BLANK
+                        {
+                            continue;
+                        }
+                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.render_cell(c, r);
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Rect => {
+                // Clear the previous preview and redraw the rectangle outline
+                // from draw_start to the current cursor position each mousemove.
+                let dirty = self.grid.abort_preview();
+                for (c, r) in dirty {
+                    self.render_cell(c, r);
+                }
+                if let Some((sc, sr)) = self.draw_start {
+                    let c0 = sc.min(col);
+                    let c1 = sc.max(col);
+                    let r0 = sr.min(row);
+                    let r1 = sr.max(row);
+                    // Collect the four edges; corners are shared so using ranges
+                    // avoids painting them twice.
+                    let mut cells: Vec<(usize, usize)> = Vec::new();
+                    for c in c0..=c1 { cells.push((c, r0)); cells.push((c, r1)); } // top & bottom
+                    for r in r0..=r1 { cells.push((c0, r)); cells.push((c1, r)); } // left & right
+                    for (c, r) in cells {
+                        if self.blend_mode == BlendMode::Stamp
+                            && self.grid.committed[Grid::idx(c, r)] != BLANK
+                        {
+                            continue;
+                        }
+                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.render_cell(c, r);
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::RectFill => {
+                let dirty = self.grid.abort_preview();
+                for (c, r) in dirty {
+                    self.render_cell(c, r);
+                }
+                if let Some((sc, sr)) = self.draw_start {
+                    let c0 = sc.min(col);
+                    let c1 = sc.max(col);
+                    let r0 = sr.min(row);
+                    let r1 = sr.max(row);
+                    for r in r0..=r1 {
+                        for c in c0..=c1 {
+                            if self.blend_mode == BlendMode::Stamp
+                                && self.grid.committed[Grid::idx(c, r)] != BLANK
+                            {
+                                continue;
+                            }
+                            self.grid.set_preview(c, r, Some(self.brush_char));
+                            self.render_cell(c, r);
+                        }
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Select => {
+                // Selection doesn't touch the grid — just update the highlighted region
+                // from draw_start to the current cell on every mousemove.
+                if let Some((sc, sr)) = self.draw_start {
+                    self.apply_selection(sc, sr, col, row);
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            _ => {} // NIY tools are silent no-ops for now
+        }
+    }
+
+    /// Finalise the in-progress stroke: commit all preview cells to the backing
+    /// store. Called on mouseup. Reuses for all tools once they are implemented.
+    pub(crate) fn commit_stroke(&mut self) {
+        let dirty = self.grid.commit_preview();
+        for (c, r) in dirty {
+            self.render_cell(c, r); // removes preview tint, applies final appearance
+        }
+        self.is_drawing = false;
+        self.draw_start  = None;
+        self.locked_axis = None;
+        self.last_painted_cell = None;
+    }
+
+    /// Cancel the in-progress stroke: discard preview without committing, and
+    /// remove the undo snapshot that was pushed at mousedown (cancelled strokes
+    /// must not appear in undo history). Called on ESC.
+    pub(crate) fn abort_stroke(&mut self) {
+        let dirty = self.grid.abort_preview();
+        for (c, r) in dirty {
+            self.render_cell(c, r); // removes preview tint, restores committed char
+        }
+        if self.tool == Tool::Select {
+            self.clear_selection(); // ESC cancels an in-progress or committed selection
+        } else {
+            self.undo_stack.pop(); // discard the pre-stroke snapshot — nothing was committed
+        }
+        self.is_drawing = false;
+        self.draw_start  = None;
+        self.locked_axis = None;
+        self.last_painted_cell = None;
+    }
+
+    // ── Undo / redo ──────────────────────────────────────────────────────────
 
     /// Snapshot committed state onto the undo stack before a destructive commit.
     /// Must be called before writing the final mouseup state, not after.
-    fn push_undo_snapshot(&mut self) {
+    pub(crate) fn push_undo_snapshot(&mut self) {
         self.undo_stack.push(self.grid.committed.clone());
         self.redo_stack.clear(); // new action invalidates the redo branch
     }
 
     /// Restore the previous committed state.
-    fn undo(&mut self) {
+    pub(crate) fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             self.redo_stack.push(self.grid.committed.clone());
             self.grid.committed = prev;
@@ -254,7 +494,7 @@ impl App {
     }
 
     /// Reapply a previously undone state.
-    fn redo(&mut self) {
+    pub(crate) fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack.push(self.grid.committed.clone());
             self.grid.committed = next;
@@ -264,54 +504,82 @@ impl App {
             self.render_all();
         }
     }
-}
 
-// ── Bresenham's line algorithm ────────────────────────────────────────────────
+    // ── Selection ────────────────────────────────────────────────────────────
 
-/// Return every (col, row) cell on the straight line from (c0,r0) to (c1,r1),
-/// inclusive of both endpoints. Used to interpolate between consecutive
-/// mousemove positions so fast strokes don't leave gaps.
-fn bresenham(c0: usize, r0: usize, c1: usize, r1: usize) -> Vec<(usize, usize)> {
-    let (mut x, mut y) = (c0 as i32, r0 as i32);
-    let (x1, y1)       = (c1 as i32, r1 as i32);
-
-    let dx =  (x1 - x).abs();
-    let dy = -(y1 - y).abs(); // negated so error term works with a single comparison
-    let sx = if x < x1 { 1 } else { -1 };
-    let sy = if y < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-
-    let mut cells = Vec::new();
-    loop {
-        cells.push((x as usize, y as usize));
-        if x == x1 && y == y1 { break; }
-        let e2 = 2 * err;
-        if e2 >= dy { err += dy; x += sx; }
-        if e2 <= dx { err += dx; y += sy; }
+    /// Remove the `.selected` CSS class from all currently selected cells and
+    /// clear the selection state. Safe to call when there is no active selection.
+    pub(crate) fn clear_selection(&mut self) {
+        if let Some((c0, r0, c1, r1)) = self.selection.take() {
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    self.cell_els[Grid::idx(c, r)]
+                        .class_list()
+                        .remove_1("selected")
+                        .unwrap();
+                }
+            }
+        }
     }
-    cells
+
+    /// Highlight a rectangular region by applying `.selected` to every cell in it.
+    /// Clears any previous selection first. Normalizes corner order automatically.
+    pub(crate) fn apply_selection(&mut self, sc: usize, sr: usize, ec: usize, er: usize) {
+        self.clear_selection();
+        let c0 = sc.min(ec);
+        let c1 = sc.max(ec);
+        let r0 = sr.min(er);
+        let r1 = sr.max(er);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                self.cell_els[Grid::idx(c, r)]
+                    .class_list()
+                    .add_1("selected")
+                    .unwrap();
+            }
+        }
+        self.selection = Some((c0, r0, c1, r1));
+    }
+
+    // ── Clipboard ────────────────────────────────────────────────────────────
+
+    /// Render the committed canvas as plain text suitable for the clipboard.
+    /// Each row is padded to COLS characters so trailing spaces are preserved,
+    /// and rows are joined with newlines. Preview layer is intentionally ignored
+    /// — copy always reflects committed state, never an in-progress stroke.
+    pub(crate) fn canvas_text(&self) -> String {
+        let mut out = String::with_capacity((COLS + 1) * ROWS);
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                out.push(self.grid.committed[Grid::idx(c, r)]);
+            }
+            if r < ROWS - 1 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Render only the selected region as plain text. Rows are padded to the
+    /// selection width (not full COLS). Returns None if there is no selection.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (c0, r0, c1, r1) = self.selection?;
+        let w = c1 - c0 + 1;
+        let h = r1 - r0 + 1;
+        let mut out = String::with_capacity((w + 1) * h);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                out.push(self.grid.committed[Grid::idx(c, r)]);
+            }
+            if r < r1 {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
 }
 
-// ── Cell hit-testing ──────────────────────────────────────────────────────────
-
-/// Read `data-col` and `data-row` from the closest `.cell` ancestor of the
-/// mouse event's target. Returns None if the event didn't land on the grid.
-fn cell_from_mouse_event(e: &MouseEvent) -> Option<(usize, usize)> {
-    let target: Element = e.target()?.dyn_into().ok()?;
-
-    // Walk up in case a sub-node (e.g. a text node's parent span) caught the event.
-    let cell_el = if target.class_list().contains("cell") {
-        target
-    } else {
-        target.closest(".cell").ok()??
-    };
-
-    let col: usize = cell_el.get_attribute("data-col")?.parse().ok()?;
-    let row: usize = cell_el.get_attribute("data-row")?.parse().ok()?;
-    Some((col, row))
-}
-
-// ── DOM construction ──────────────────────────────────────────────────────────
+// ── DOM construction ─────────────────────────────────────────────────────────
 
 /// Populate `#grid` with COLS×ROWS `<span class="cell">` elements.
 /// Returns the flat element vec stored in App for direct render access.
@@ -321,7 +589,6 @@ fn build_grid(document: &Document) -> Vec<Element> {
         .expect("#grid must exist in HTML");
 
     let mut cell_els = Vec::with_capacity(COLS * ROWS);
-
     for r in 0..ROWS {
         for c in 0..COLS {
             let el = document
@@ -336,7 +603,6 @@ fn build_grid(document: &Document) -> Vec<Element> {
             cell_els.push(el);
         }
     }
-
     cell_els
 }
 
@@ -377,7 +643,7 @@ fn build_palette(document: &Document) {
         Some(PalEntry { label: "│", ch: '│', initially_active: false }),
         Some(PalEntry { label: "┼", ch: '┼', initially_active: false }),
         None,
-        Some(PalEntry { label: "␣", ch: ' ', initially_active: false }), // space = erase
+        Some(PalEntry { label: "⣠", ch: ' ', initially_active: false }), // space = erase
     ];
 
     for entry in entries {
@@ -404,7 +670,42 @@ fn build_palette(document: &Document) {
     }
 }
 
-// ── Demo content ──────────────────────────────────────────────────────────────
+/// Create the `#mode-dropdown` fly-out and append it to `#toolbar`.
+/// The dropdown is hidden by default (no `.open` class); `wire_blend_mode`
+/// toggles visibility in response to mousedown / mouseup.
+fn build_blend_mode_control(document: &Document) {
+    let toolbar = document
+        .get_element_by_id("toolbar")
+        .expect("#toolbar must exist in HTML");
+
+    let dropdown = document.create_element("div").unwrap();
+    dropdown.set_attribute("id", "mode-dropdown").unwrap();
+
+    // One tile per blend mode — Overwrite starts selected (matches App default).
+    let modes: &[(&str, &str, &str, bool)] = &[
+        ("overwrite",  "▊", "Overwrite — replace any cell",   true),
+        ("stamp",      "⬚", "Stamp — paint only blank cells", false),
+        ("combine",    "┼", "Combine (NIY)",                  false),
+        ("difference", "∖", "Difference (NIY)",               false),
+    ];
+
+    for &(mode_id, icon, title, initially_selected) in modes {
+        let tile = document.create_element("div").unwrap();
+        tile.set_class_name(if initially_selected {
+            "mode-tile selected"
+        } else {
+            "mode-tile"
+        });
+        tile.set_attribute("data-mode", mode_id).unwrap();
+        tile.set_attribute("title", title).unwrap();
+        tile.set_text_content(Some(icon));
+        dropdown.append_child(&tile).unwrap();
+    }
+
+    toolbar.append_child(&dropdown).unwrap();
+}
+
+// ── Demo content ─────────────────────────────────────────────────────────────
 
 /// Draw a border and greeting to prove the Rust→DOM rendering pipeline works.
 /// Remove or replace once real drawing tools are exercised.
@@ -435,232 +736,6 @@ fn draw_demo(app: &mut App) {
     app.render_all();
 }
 
-// ── Event wiring ──────────────────────────────────────────────────────────────
-
-/// Attach mouse handlers to `#grid` and a global mouseup handler to `window`.
-///
-/// mousedown → begin stroke and paint first cell
-/// mousemove → continue painting while button held
-/// mouseup   → commit stroke, push undo snapshot
-/// TBD: ESC keydown → abort_preview (cancel in-progress operation)
-fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
-    let grid_el = document.get_element_by_id("grid").unwrap();
-
-    // mousedown — start a new draw stroke
-    {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            e.prevent_default(); // suppress browser text-selection during drag
-            if let Some((col, row)) = cell_from_mouse_event(&e) {
-                let mut a = app.borrow_mut();
-                // Snapshot before the stroke begins so Ctrl+Z restores pre-stroke state.
-                // Also clears redo stack — a new stroke invalidates any undone future.
-                a.push_undo_snapshot();
-                a.is_drawing = true;
-                a.last_painted_cell = None; // fresh stroke — no interpolation on first cell
-                a.paint_stroke_to(col, row);
-            }
-        });
-        grid_el
-            .add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget(); // closure must live for the page lifetime
-    }
-
-    // mousemove — extend the stroke, Bresenham-filling any skipped cells
-    {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            let mut a = app.borrow_mut();
-            if !a.is_drawing {
-                return;
-            }
-            if let Some((col, row)) = cell_from_mouse_event(&e) {
-                a.paint_stroke_to(col, row);
-            }
-        });
-        grid_el
-            .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget();
-    }
-
-    // mouseup on window — commit the finished stroke
-    // Listening on window (not just #grid) catches releases outside the canvas.
-    {
-        let window: Window = web_sys::window().unwrap();
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |_e: MouseEvent| {
-            let mut a = app.borrow_mut();
-            if a.is_drawing {
-                // TBD: for preview-based tools (line, rect) commit_preview() fires here.
-                a.is_drawing = false;
-                a.last_painted_cell = None;
-            }
-        });
-        window
-            .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget();
-    }
-}
-
-/// Wire click handlers to `.tool` toolbar buttons.
-/// Each button's `data-tool` attribute identifies the Tool variant to activate.
-fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
-    let tool_nodes: NodeList = document.query_selector_all(".tool").unwrap();
-
-    for i in 0..tool_nodes.length() {
-        let el: Element = tool_nodes
-            .item(i)
-            .unwrap()
-            .dyn_into()
-            .expect("tool node must be Element");
-
-        let tool = match el
-            .get_attribute("data-tool")
-            .and_then(|s| Tool::from_data_attr(&s))
-        {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let app       = Rc::clone(app);
-        let el_clone  = el.clone();
-        let doc_clone = document.clone();
-
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().tool = tool;
-
-            // Move the `active` CSS class to the clicked button
-            let all = doc_clone.query_selector_all(".tool").unwrap();
-            for j in 0..all.length() {
-                let t: Element = all.item(j).unwrap().dyn_into().unwrap();
-                t.class_list().remove_1("active").unwrap();
-            }
-            el_clone.class_list().add_1("active").unwrap();
-        });
-
-        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget();
-    }
-}
-
-/// Wire click handlers to `.pal-char` palette entries.
-/// Each entry's `data-char` attribute holds the character it represents.
-fn wire_palette(document: &Document, app: &Rc<RefCell<App>>) {
-    let pal_nodes: NodeList = document.query_selector_all(".pal-char").unwrap();
-
-    for i in 0..pal_nodes.length() {
-        let el: Element = pal_nodes
-            .item(i)
-            .unwrap()
-            .dyn_into()
-            .expect("palette node must be Element");
-
-        // Parse the character from the data attribute set by build_palette()
-        let ch: char = match el
-            .get_attribute("data-char")
-            .and_then(|s| s.chars().next())
-        {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let app       = Rc::clone(app);
-        let el_clone  = el.clone();
-        let doc_clone = document.clone();
-
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().brush_char = ch;
-
-            // Move the `active` CSS class to the clicked palette entry
-            let all = doc_clone.query_selector_all(".pal-char").unwrap();
-            for j in 0..all.length() {
-                let p: Element = all.item(j).unwrap().dyn_into().unwrap();
-                p.class_list().remove_1("active").unwrap();
-            }
-            el_clone.class_list().add_1("active").unwrap();
-        });
-
-        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-            .unwrap();
-        cb.forget();
-    }
-}
-
-/// Wire the ↩/↪ undo/redo buttons and Ctrl+Z / Shift+Ctrl+Z keyboard shortcuts.
-fn wire_undo_redo(document: &Document, app: &Rc<RefCell<App>>) {
-    // ↩ Undo button click
-    if let Some(btn) = document.get_element_by_id("btn-undo") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || { app.borrow_mut().undo(); });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // ↪ Redo button click
-    if let Some(btn) = document.get_element_by_id("btn-redo") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || { app.borrow_mut().redo(); });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // Keyboard: Ctrl+Z → undo, Shift+Ctrl+Z → redo
-    // Listening on window so it works regardless of which element has focus.
-    {
-        let window: Window = web_sys::window().unwrap();
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-            if e.ctrl_key() && e.key() == "z" {
-                e.prevent_default(); // suppress browser's own undo in any editable fields
-                if e.shift_key() {
-                    app.borrow_mut().redo();
-                } else {
-                    app.borrow_mut().undo();
-                }
-            }
-        });
-        window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-}
-
-/// Wire the light/dark theme toggle button.
-/// Flips `data-theme` on `<html>` so CSS variable rules re-evaluate automatically.
-fn wire_theme_toggle(document: &Document, app: &Rc<RefCell<App>>) {
-    let btn = match document.get_element_by_id("theme-toggle") {
-        Some(el) => el,
-        None => return,
-    };
-
-    let app       = Rc::clone(app);
-    let doc_clone = document.clone();
-
-    let cb = Closure::<dyn FnMut()>::new(move || {
-        let mut a = app.borrow_mut();
-        a.dark_mode = !a.dark_mode;
-        let dark = a.dark_mode;
-
-        doc_clone
-            .document_element()
-            .unwrap()
-            .set_attribute("data-theme", if dark { "dark" } else { "light" })
-            .unwrap();
-
-        // Update the button label to show what clicking again will do
-        if let Some(b) = doc_clone.get_element_by_id("theme-toggle") {
-            b.set_text_content(Some(if dark { "☀ Light" } else { "☾ Dark" }));
-        }
-    });
-
-    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-        .unwrap();
-    cb.forget();
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Called automatically by the generated JS glue when `init()` is awaited.
@@ -676,6 +751,7 @@ pub fn start() {
     // Build the dynamic DOM sections that Rust owns
     let cell_els = build_grid(&document);
     build_palette(&document);
+    build_blend_mode_control(&document);
 
     // Initialise shared application state (shared via Rc<RefCell> across closures)
     let app = Rc::new(RefCell::new(App::new(cell_els)));
@@ -689,4 +765,6 @@ pub fn start() {
     wire_palette(&document, &app);
     wire_undo_redo(&document, &app);
     wire_theme_toggle(&document, &app);
+    wire_blend_mode(&document, &app);
+    wire_copy(&document, &app);
 }

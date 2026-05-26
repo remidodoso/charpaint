@@ -17,27 +17,29 @@
     /* Switched by toggling data-theme on <html>; Rust does the toggle.       */
 
     :root[data-theme="dark"] {
-      --bg:         #1e1e1e;
-      --chrome:     #2d2d2d;  /* toolbar, menu bar, palette background */
-      --border:     #444;
-      --text:       #d4d4d4;
-      --text-dim:   #888;
-      --canvas-bg:  #0d0d0d;  /* the character grid background */
-      --canvas-fg:  #cccccc;  /* default character colour */
-      --hover-bg:   #1a2e1a;  /* cell hover tint */
-      --accent:     #4ec9b0;  /* active tool/palette highlight */
+      --bg:          #1e1e1e;
+      --chrome:      #2d2d2d;  /* toolbar, menu bar, palette background */
+      --border:      #444;
+      --text:        #d4d4d4;
+      --text-dim:    #888;
+      --canvas-bg:   #0d0d0d;  /* the character grid background */
+      --canvas-fg:   #cccccc;  /* default character colour */
+      --hover-bg:    #1a2e1a;  /* cell hover tint */
+      --accent:      #4ec9b0;  /* active tool/palette highlight */
+      --select-tint: rgba(0, 160, 155, 0.28); /* selection fill — dim desaturated cyan */
     }
 
     :root[data-theme="light"] {
-      --bg:         #e8e8e8;
-      --chrome:     #d0d0d0;
-      --border:     #aaa;
-      --text:       #1e1e1e;
-      --text-dim:   #555;
-      --canvas-bg:  #ffffff;
-      --canvas-fg:  #1e1e1e;
-      --hover-bg:   #d0ecd0;
-      --accent:     #007a6e;
+      --bg:          #e8e8e8;
+      --chrome:      #d0d0d0;
+      --border:      #aaa;
+      --text:        #1e1e1e;
+      --text-dim:    #555;
+      --canvas-bg:   #ffffff;
+      --canvas-fg:   #1e1e1e;
+      --hover-bg:    #d0ecd0;
+      --accent:      #007a6e;
+      --select-tint: rgba(0, 120, 115, 0.20); /* slightly darker for visibility on white */
     }
 
     /* ── Page layout ──────────────────────────────────────────────────────── */
@@ -91,6 +93,19 @@
     }
     #menubar .menu-action:hover { background: var(--border); }
 
+    /* Flash state: applied briefly when a keyboard shortcut fires, so the user
+       can see which button corresponds to the key they pressed — classic Mac behaviour. */
+    #menubar .menu-action.flash {
+      background: var(--accent);
+      color: #000;
+    }
+
+    /* Error flash: applied briefly when an action fails (e.g. clipboard denied). */
+    #menubar .menu-action.flash-error {
+      background: #c0392b;
+      color: #fff;
+    }
+
     /* Thin vertical rule separating undo/redo from the File menu group */
     #menubar .menu-sep {
       width: 1px;
@@ -133,6 +148,7 @@
       gap: 2px;
       flex-shrink: 0;
       user-select: none;
+      position: relative; /* anchors #mode-dropdown absolute positioning */
     }
     .tool-row { display: flex; gap: 2px; }
 
@@ -162,6 +178,53 @@
       height: 1px;
       background: var(--border);
       margin: 4px 0;
+    }
+
+    /* Empty placeholder slot — visual sibling to the mode button, non-interactive */
+    .tool-empty {
+      width: 24px;
+      height: 24px;
+      border-radius: 3px;
+      border: 1px dashed var(--border);
+      opacity: 0.25;
+      pointer-events: none;
+    }
+
+    /* Blend mode fly-out — floats to the right of the toolbar, anchored to its top */
+    #mode-dropdown {
+      position: absolute;
+      left: 100%;     /* flush with the toolbar's right edge */
+      top: 0;
+      background: var(--chrome);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px;
+      display: none;  /* Rust adds/removes .open */
+      flex-direction: column;
+      gap: 2px;
+      z-index: 100;
+      box-shadow: 2px 4px 8px rgba(0,0,0,0.4);
+    }
+    #mode-dropdown.open { display: flex; }
+
+    /* Individual tile inside the blend mode dropdown */
+    .mode-tile {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 14px;
+      border: 1px solid transparent;
+      color: var(--text);
+    }
+    .mode-tile:hover { background: var(--border); }
+    .mode-tile.selected {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
     }
 
     /* ── Canvas area ──────────────────────────────────────────────────────── */
@@ -205,6 +268,11 @@
     .cell.preview {
       background: color-mix(in srgb, var(--accent) 25%, transparent);
       color: var(--accent);
+    }
+
+    /* Selected state: cell is inside the current selection rectangle */
+    .cell.selected {
+      background: var(--select-tint);
     }
 
     /* ── Palette strip ────────────────────────────────────────────────────── */
@@ -266,8 +334,9 @@
   <div id="menubar">
     <span class="brand">charpaint</span>
     <!-- Undo / redo — click handlers and Ctrl+Z/Shift+Ctrl+Z wired by Rust -->
-    <button id="btn-undo" class="menu-action" title="Undo (Ctrl+Z)">↩</button>
-    <button id="btn-redo" class="menu-action" title="Redo (Shift+Ctrl+Z)">↪</button>
+    <button id="btn-undo"  class="menu-action" title="Undo (Ctrl+Z)">↩</button>
+    <button id="btn-redo"  class="menu-action" title="Redo (Shift+Ctrl+Z)">↪</button>
+    <button id="btn-copy"  class="menu-action" title="Copy canvas to clipboard">⧉</button>
     <span class="menu-sep"></span>
     <span class="menu-item">File</span>
     <span class="menu-item">Edit</span>
@@ -282,6 +351,13 @@
 
     <!-- Toolbar — icons and data-tool attrs defined here; click handlers wired by Rust -->
     <div id="toolbar">
+      <!-- Blend mode tile: shows current mode icon; mousedown+drag opens the fly-out (wired by Rust) -->
+      <!-- #mode-dropdown is appended here by build_blend_mode_control() -->
+      <div class="tool-row">
+        <div class="tool" id="mode-btn" title="Blend mode: Overwrite">▊</div>
+        <div class="tool-empty"></div>
+      </div>
+      <div class="tool-sep"></div>
       <div class="tool-row">
         <div class="tool active" data-tool="pencil"    title="Pencil">✎</div>
         <div class="tool"        data-tool="select"    title="Select">⬚</div>

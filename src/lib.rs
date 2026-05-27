@@ -14,7 +14,7 @@ mod util;
 use util::bresenham;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -95,6 +95,41 @@ impl LineMode {
     }
 }
 
+// ── FillMode ─────────────────────────────────────────────────────────────────
+
+/// Whether the fill tool spreads through orthogonal neighbours only (4-adjacent)
+/// or all 8 neighbours including diagonals (8-adjacent).
+/// Flood4 is the default — it respects outline shapes drawn with the oval/rect tools.
+/// Flood8 is useful for filling regions not fully enclosed by a solid border.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum FillMode {
+    Flood4, // up/down/left/right only — doesn't leak through diagonal gaps in outlines
+    Flood8, // all 8 directions — fills corner-connected regions too
+}
+
+impl FillMode {
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            FillMode::Flood4 => "✣",
+            FillMode::Flood8 => "❊",
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            FillMode::Flood4 => "Fill (4-adjacent)",
+            FillMode::Flood8 => "Fill (8-adjacent)",
+        }
+    }
+
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            FillMode::Flood4 => FillMode::Flood8,
+            FillMode::Flood8 => FillMode::Flood4,
+        }
+    }
+}
+
 // ── Axis ─────────────────────────────────────────────────────────────────────
 
 /// Constraint axis for Shift-locked drawing. Once determined for a stroke,
@@ -112,11 +147,11 @@ pub(crate) enum Tool {
     Pencil,
     Eraser,
     Select,   // NIY
-    Fill,     // NIY
+    Fill,
     Text,
-    Line,     // NIY — will use brush char or directional chars (─ │ ╲ ╱)
-    Rect,     // NIY — hollow rectangle, style driven by palette selection
-    RectFill, // NIY — filled rectangle
+    Line,
+    Rect,
+    RectFill,
     Oval,
     OvalFill,
 }
@@ -253,6 +288,7 @@ pub(crate) struct App {
     pub(crate) dark_mode: bool,
     pub(crate) blend_mode: BlendMode, // how new paint interacts with existing cells
     pub(crate) line_mode:  LineMode,  // character-stamp vs art-geometry line drawing
+    pub(crate) fill_mode:  FillMode,  // 4-adjacent vs 8-adjacent flood fill
 
     /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
     /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
@@ -297,6 +333,7 @@ impl App {
             dark_mode:  true,
             blend_mode: BlendMode::Overwrite,
             line_mode:  LineMode::Character,
+            fill_mode:  FillMode::Flood4,
             selection: None,
             text_cursor: None,
             text_origin: None,
@@ -644,6 +681,29 @@ impl App {
                 // from draw_start to the current cell on every mousemove.
                 if let Some((sc, sr)) = self.draw_start {
                     self.apply_selection(sc, sr, col, row);
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Fill => {
+                // Flood fill is a one-shot operation — act only on the first call
+                // (mousedown). Subsequent mousemove calls are skipped by checking
+                // whether last_painted_cell is already set.
+                if self.last_painted_cell.is_some() { return; }
+                let target_char = self.grid.committed[Grid::idx(col, row)];
+                // No-op when the cell already contains the brush character; filling
+                // would either do nothing or loop forever.
+                if target_char != self.brush_char {
+                    let diagonals = self.fill_mode == FillMode::Flood8;
+                    for (c, r) in flood_fill_cells(col, row, target_char, &self.grid.committed, diagonals) {
+                        if self.blend_mode == BlendMode::Stamp
+                            && self.grid.committed[Grid::idx(c, r)] != BLANK
+                        {
+                            continue;
+                        }
+                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.render_cell(c, r);
+                    }
                 }
                 self.last_painted_cell = Some((col, row));
             }
@@ -1192,6 +1252,47 @@ fn filled_ellipse_cells(bx0: i64, by0: i64, bx1: i64, by1: i64) -> Vec<(usize, u
     cells
 }
 
+/// 8-directional flood fill: return every cell reachable from (start_col, start_row)
+/// via cells whose committed character equals `target_char`.
+/// Uses BFS so the fill order is outward from the origin — natural for a paint bucket.
+/// The canvas is small (80×24 = 1920 cells max) so a flat visited bitset is fast.
+fn flood_fill_cells(
+    start_col: usize,
+    start_row: usize,
+    target_char: char,
+    committed: &[char],
+    diagonals: bool,
+) -> Vec<(usize, usize)> {
+    let mut visited = vec![false; COLS * ROWS];
+    let mut queue   = std::collections::VecDeque::new();
+    let mut result  = Vec::new();
+
+    let start_idx = Grid::idx(start_col, start_row);
+    visited[start_idx] = true;
+    queue.push_back((start_col, start_row));
+
+    while let Some((c, r)) = queue.pop_front() {
+        result.push((c, r));
+        // Check neighbours — diagonals included only in Flood8 mode.
+        for dr in -1i32..=1 {
+            for dc in -1i32..=1 {
+                if dc == 0 && dr == 0 { continue; }
+                if !diagonals && dc != 0 && dr != 0 { continue; }
+                let nc = c as i32 + dc;
+                let nr = r as i32 + dr;
+                if nc < 0 || nr < 0 || nc >= COLS as i32 || nr >= ROWS as i32 { continue; }
+                let (nc, nr) = (nc as usize, nr as usize);
+                let idx = Grid::idx(nc, nr);
+                if !visited[idx] && committed[idx] == target_char {
+                    visited[idx] = true;
+                    queue.push_back((nc, nr));
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Map a Bresenham step direction vector to the ASCII art character that best
 /// represents it. Covers all four axis-aligned and diagonal cases.
 fn art_char(dc: i32, dr: i32) -> char {
@@ -1279,6 +1380,7 @@ pub fn start() {
     wire_theme_toggle(&document, &app);
     wire_blend_mode(&document, &app);
     wire_line_tool(&document, &app);
+    wire_fill_tool(&document, &app);
     wire_copy(&document, &app);
     wire_clear(&document, &app);
     wire_touch(&document, &app);

@@ -110,8 +110,8 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
             None => continue,
         };
 
-        // Line tool has sub-modes and tap-to-cycle; wired separately by wire_line_tool.
-        if tool == Tool::Line { continue; }
+        // Line and Fill have sub-modes and tap-to-cycle; wired separately.
+        if tool == Tool::Line || tool == Tool::Fill { continue; }
 
         let app       = Rc::clone(app);
         let el_clone  = el.clone();
@@ -855,6 +855,94 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
             .add_event_listener_with_callback("touchcancel", cb.as_ref().unchecked_ref())
             .unwrap();
         cb.forget();
+    }
+}
+
+/// Wire the `#fill-tool-btn` fill-tool button.
+///
+/// Tap-to-select, tap-again-to-cycle:
+///   • First tap when fill is not active: activates the fill tool.
+///   • Second tap when already active: cycles FillMode (Flood4 ↔ Flood8)
+///     and updates the button icon/title.
+///
+/// Same three-listener pattern as `wire_line_tool`.
+pub fn wire_fill_tool(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("fill-tool-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse events.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — select-or-cycle for touch devices.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            fill_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — select-or-cycle for desktop mouse, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            fill_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Shared action for touch and mouse fill-tool taps.
+/// First tap (tool inactive): selects fill and moves `.active`.
+/// Second tap (tool already active): cycles FillMode and updates icon/title.
+fn fill_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
+    let already_active = app.borrow().tool == Tool::Fill;
+
+    if already_active {
+        let mode = {
+            let mut a = app.borrow_mut();
+            a.fill_mode = a.fill_mode.cycle();
+            a.fill_mode
+        };
+        btn.set_text_content(Some(mode.icon()));
+        btn.set_attribute("title", &format!("{} — tap again to cycle mode", mode.name())).unwrap();
+    } else {
+        {
+            let mut a = app.borrow_mut();
+            a.commit_text_session();
+            a.clear_selection();
+            a.tool = Tool::Fill;
+        }
+        // Sync icon/title to the current fill_mode (may have been cycled previously).
+        let mode = app.borrow().fill_mode;
+        btn.set_text_content(Some(mode.icon()));
+        btn.set_attribute("title", &format!("{} — tap again to cycle mode", mode.name())).unwrap();
+        let all = document.query_selector_all("[data-tool]").unwrap();
+        for j in 0..all.length() {
+            let t: Element = all.item(j).unwrap().dyn_into().unwrap();
+            t.class_list().remove_1("active").unwrap();
+        }
+        btn.class_list().add_1("active").unwrap();
     }
 }
 

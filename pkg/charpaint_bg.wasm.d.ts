@@ -3,10 +3,11 @@
 export const memory: WebAssembly.Memory;
 export const start: () => void;
 export const wasm_bindgen__convert__closures_____invoke__h50e71d335a90cf31: (a: number, b: number, c: any) => [number, number];
-export const wasm_bindgen__convert__closures_____invoke__h4eb490a118e05d69: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__h4eb490a118e05d69_2: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__h4eb490a118e05d69_3: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__h060e7b661a96859a: (a: number, b: number) => void;
+export const wasm_bindgen__convert__closures_____invoke__h4d794a5a7d083e0a: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h4d794a5a7d083e0a_2: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h4d794a5a7d083e0a_3: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h4d794a5a7d083e0a_4: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__ha06a5daac8d90b9c: (a: number, b: number) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_exn_store: (a: number) => void;

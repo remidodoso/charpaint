@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use web_sys::{Document, Element, Window};
+use wasm_bindgen::JsCast;
+use web_sys::{Document, Element, HtmlInputElement, Window};
 
 mod util;
 use util::bresenham;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy, wire_touch};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -22,6 +23,9 @@ const ROWS: usize = 24;
 
 /// The character placed in a cell when it is blank / erased.
 const BLANK: char = ' ';
+
+/// The block character used as the blinking text cursor.
+const CURSOR_CHAR: char = '▄'; // LOWER HALF BLOCK U+2584
 
 // ── BlendMode ────────────────────────────────────────────────────────────────
 
@@ -35,24 +39,32 @@ pub(crate) enum BlendMode {
 }
 
 impl BlendMode {
-    /// HTML `data-mode` attribute string → BlendMode variant.
-    pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
-        match s {
-            "overwrite"  => Some(BlendMode::Overwrite),
-            "stamp"      => Some(BlendMode::Stamp),
-            "combine"    => Some(BlendMode::Combine),
-            "difference" => Some(BlendMode::Difference),
-            _            => None,
-        }
-    }
-
-    /// Unicode icon for the mode, displayed in the mode-button tile.
+    /// Unicode icon for the mode, shown in the mode button.
     pub(crate) fn icon(&self) -> &'static str {
         match self {
             BlendMode::Overwrite  => "▊",
             BlendMode::Stamp      => "⬚",
             BlendMode::Combine    => "┼",
             BlendMode::Difference => "∖",
+        }
+    }
+
+    /// Human-readable name for button titles.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            BlendMode::Overwrite  => "Overwrite",
+            BlendMode::Stamp      => "Stamp",
+            BlendMode::Combine    => "Combine",
+            BlendMode::Difference => "Difference",
+        }
+    }
+
+    /// Advance to the next implemented blend mode.
+    /// Combine and Difference are NIY — excluded from the cycle.
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            BlendMode::Overwrite => BlendMode::Stamp,
+            _                    => BlendMode::Overwrite,
         }
     }
 }
@@ -67,18 +79,18 @@ pub(crate) enum LineMode {
 }
 
 impl LineMode {
-    pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
-        match s {
-            "character" => Some(LineMode::Character),
-            "art"       => Some(LineMode::Art),
-            _           => None,
-        }
-    }
-
     pub(crate) fn icon(&self) -> &'static str {
         match self {
             LineMode::Character => "╲",
             LineMode::Art       => "📐",
+        }
+    }
+
+    /// Advance to the next line mode.
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            LineMode::Character => LineMode::Art,
+            LineMode::Art       => LineMode::Character,
         }
     }
 }
@@ -101,12 +113,12 @@ pub(crate) enum Tool {
     Eraser,
     Select,   // NIY
     Fill,     // NIY
-    Text,     // NIY
+    Text,
     Line,     // NIY — will use brush char or directional chars (─ │ ╲ ╱)
     Rect,     // NIY — hollow rectangle, style driven by palette selection
     RectFill, // NIY — filled rectangle
     Oval,
-    OvalFill, // NIY
+    OvalFill,
 }
 
 impl Tool {
@@ -231,15 +243,26 @@ pub(crate) struct App {
     /// States available for redo. Populated by undo(); cleared by new commits.
     redo_stack: Vec<Vec<char>>,
 
+    pub(crate) shift_locked: bool,       // true when the ⇧ toggle is active (axis constraint)
     pub(crate) dark_mode: bool,
-    pub(crate) blend_mode:         BlendMode, // how new paint interacts with existing cells
-    pub(crate) mode_dropdown_open: bool,      // true while the blend mode fly-out is visible
-    pub(crate) line_mode:               LineMode, // character-stamp vs art-geometry line drawing
-    pub(crate) line_mode_dropdown_open: bool,     // true while the line mode fly-out is visible
+    pub(crate) blend_mode: BlendMode, // how new paint interacts with existing cells
+    pub(crate) line_mode:  LineMode,  // character-stamp vs art-geometry line drawing
 
     /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
     /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
     pub(crate) selection: Option<(usize, usize, usize, usize)>,
+
+    /// Next cell position to type into. Some((col, row)) where col may == COLS
+    /// (meaning the cursor is past the right edge; no visual cursor shown).
+    /// None when no text session is active.
+    pub(crate) text_cursor: Option<(usize, usize)>,
+    /// Cell where the current text session began. Used by ESC to restart the
+    /// cursor at the session origin after discarding all typed characters.
+    pub(crate) text_origin: Option<(usize, usize)>,
+
+    /// The off-screen hidden `<input>` focused to raise the mobile virtual
+    /// keyboard when a text session is active. Blurred on session end.
+    text_input_el: HtmlInputElement,
 
     // ── Touch / pinch-zoom state ─────────────────────────────────────────────
     grid_el:                          Element,      // #grid element — target for font-size changes
@@ -251,7 +274,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -263,12 +286,14 @@ impl App {
             last_painted_cell: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            shift_locked: false,
             dark_mode:  true,
-            blend_mode:         BlendMode::Overwrite,
-            mode_dropdown_open: false,
-            line_mode:               LineMode::Character,
-            line_mode_dropdown_open: false,
+            blend_mode: BlendMode::Overwrite,
+            line_mode:  LineMode::Character,
             selection: None,
+            text_cursor: None,
+            text_origin: None,
+            text_input_el,
             grid_el,
             font_size:             16.0,
             is_two_finger:         false,
@@ -376,7 +401,7 @@ impl App {
         match self.tool {
             Tool::Pencil | Tool::Eraser => {
                 let ch = if self.tool == Tool::Pencil { self.brush_char } else { BLANK };
-                let (col, row) = self.resolve_target(col, row, shift_held);
+                let (col, row) = self.resolve_target(col, row, shift_held || self.shift_locked);
                 let cells = match self.last_painted_cell {
                     Some((pc, pr)) => bresenham(pc, pr, col, row),
                     None           => vec![(col, row)],
@@ -440,22 +465,45 @@ impl App {
             }
 
             Tool::Rect => {
-                // Clear the previous preview and redraw the rectangle outline
-                // from draw_start to the current cursor position each mousemove.
+                // Clear the previous preview and redraw the rectangle outline each mousemove.
+                //
+                // Normal mode: draw_start and current cell are opposite corners.
+                // Shift mode:  draw_start is the center; current cell defines the half-extents.
+                //              Bounding box is symmetric and may extend outside the canvas —
+                //              per-cell bounds check silently skips any off-canvas cells.
                 let dirty = self.grid.abort_preview();
                 for (c, r) in dirty {
                     self.render_cell(c, r);
                 }
                 if let Some((sc, sr)) = self.draw_start {
-                    let c0 = sc.min(col);
-                    let c1 = sc.max(col);
-                    let r0 = sr.min(row);
-                    let r1 = sr.max(row);
-                    // Collect the four edges; corners are shared so using ranges
-                    // avoids painting them twice.
+                    let (bx0, by0, bx1, by1): (i64, i64, i64, i64) = if shift_held || self.shift_locked {
+                        let cx = sc as i64;
+                        let cy = sr as i64;
+                        let dx = (col as i64 - cx).abs();
+                        let dy = (row as i64 - cy).abs();
+                        (cx - dx, cy - dy, cx + dx, cy + dy)
+                    } else {
+                        (sc.min(col) as i64, sr.min(row) as i64,
+                         sc.max(col) as i64, sr.max(row) as i64)
+                    };
+                    let in_bounds = |x: i64, y: i64| -> Option<(usize, usize)> {
+                        if x >= 0 && y >= 0 && (x as usize) < COLS && (y as usize) < ROWS {
+                            Some((x as usize, y as usize))
+                        } else {
+                            None
+                        }
+                    };
+                    // Top and bottom edges, then left and right edges.
+                    // Corners are visited twice but set_preview is idempotent.
                     let mut cells: Vec<(usize, usize)> = Vec::new();
-                    for c in c0..=c1 { cells.push((c, r0)); cells.push((c, r1)); } // top & bottom
-                    for r in r0..=r1 { cells.push((c0, r)); cells.push((c1, r)); } // left & right
+                    for x in bx0..=bx1 {
+                        if let Some(p) = in_bounds(x, by0) { cells.push(p); }
+                        if let Some(p) = in_bounds(x, by1) { cells.push(p); }
+                    }
+                    for y in by0..=by1 {
+                        if let Some(p) = in_bounds(bx0, y) { cells.push(p); }
+                        if let Some(p) = in_bounds(bx1, y) { cells.push(p); }
+                    }
                     for (c, r) in cells {
                         if self.blend_mode == BlendMode::Stamp
                             && self.grid.committed[Grid::idx(c, r)] != BLANK
@@ -470,17 +518,29 @@ impl App {
             }
 
             Tool::RectFill => {
+                // Same bounding-box logic as Rect — normal is corner-to-corner,
+                // Shift is center-origin. Per-cell bounds check clips off-canvas cells.
                 let dirty = self.grid.abort_preview();
                 for (c, r) in dirty {
                     self.render_cell(c, r);
                 }
                 if let Some((sc, sr)) = self.draw_start {
-                    let c0 = sc.min(col);
-                    let c1 = sc.max(col);
-                    let r0 = sr.min(row);
-                    let r1 = sr.max(row);
-                    for r in r0..=r1 {
-                        for c in c0..=c1 {
+                    let (bx0, by0, bx1, by1): (i64, i64, i64, i64) = if shift_held || self.shift_locked {
+                        let cx = sc as i64;
+                        let cy = sr as i64;
+                        let dx = (col as i64 - cx).abs();
+                        let dy = (row as i64 - cy).abs();
+                        (cx - dx, cy - dy, cx + dx, cy + dy)
+                    } else {
+                        (sc.min(col) as i64, sr.min(row) as i64,
+                         sc.max(col) as i64, sr.max(row) as i64)
+                    };
+                    for y in by0..=by1 {
+                        for x in bx0..=bx1 {
+                            if x < 0 || y < 0 || (x as usize) >= COLS || (y as usize) >= ROWS {
+                                continue;
+                            }
+                            let (c, r) = (x as usize, y as usize);
                             if self.blend_mode == BlendMode::Stamp
                                 && self.grid.committed[Grid::idx(c, r)] != BLANK
                             {
@@ -495,14 +555,58 @@ impl App {
             }
 
             Tool::Oval => {
-                // Clear previous preview, then redraw the ellipse inscribed in the
-                // bounding box from draw_start to the current cell.
+                // Clear previous preview, then redraw the ellipse each mousemove.
+                //
+                // Normal mode: draw_start and current cell are opposite bounding-box corners.
+                // Shift mode:  draw_start is the center; current cell defines the half-extents.
+                //              The bounding box is expanded symmetrically, so it can extend
+                //              outside the canvas — ellipse_cells clips those cells silently.
                 let dirty = self.grid.abort_preview();
                 for (c, r) in dirty {
                     self.render_cell(c, r);
                 }
                 if let Some((sc, sr)) = self.draw_start {
-                    for (c, r) in ellipse_cells(sc, sr, col, row) {
+                    let (bx0, by0, bx1, by1) = if shift_held || self.shift_locked {
+                        let cx = sc as i64;
+                        let cy = sr as i64;
+                        let dx = (col as i64 - cx).abs();
+                        let dy = (row as i64 - cy).abs();
+                        (cx - dx, cy - dy, cx + dx, cy + dy)
+                    } else {
+                        (sc as i64, sr as i64, col as i64, row as i64)
+                    };
+                    for (c, r) in ellipse_cells(bx0, by0, bx1, by1) {
+                        if self.blend_mode == BlendMode::Stamp
+                            && self.grid.committed[Grid::idx(c, r)] != BLANK
+                        {
+                            continue;
+                        }
+                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        self.render_cell(c, r);
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::OvalFill => {
+                // Same bounding-box logic as Oval — normal is corner-to-corner,
+                // Shift is center-origin. Uses filled_ellipse_cells so interior
+                // and outline share the same integer geometry.
+                let dirty = self.grid.abort_preview();
+                for (c, r) in dirty {
+                    self.render_cell(c, r);
+                }
+                if let Some((sc, sr)) = self.draw_start {
+                    let (bx0, by0, bx1, by1) = if shift_held || self.shift_locked {
+                        let cx = sc as i64;
+                        let cy = sr as i64;
+                        let dx = (col as i64 - cx).abs();
+                        let dy = (row as i64 - cy).abs();
+                        (cx - dx, cy - dy, cx + dx, cy + dy)
+                    } else {
+                        (sc as i64, sr as i64, col as i64, row as i64)
+                    };
+                    for (c, r) in filled_ellipse_cells(bx0, by0, bx1, by1) {
                         if self.blend_mode == BlendMode::Stamp
                             && self.grid.committed[Grid::idx(c, r)] != BLANK
                         {
@@ -560,6 +664,29 @@ impl App {
         self.last_painted_cell = None;
     }
 
+    // ── Clear ────────────────────────────────────────────────────────────────
+
+    /// Erase content and push an undo snapshot.
+    /// If a selection is active, erases only the selected region then deselects.
+    /// Otherwise erases the entire canvas.
+    pub(crate) fn clear_canvas(&mut self) {
+        self.commit_text_session(); // commit any open text entry before clearing
+        self.push_undo_snapshot();
+        if let Some((c0, r0, c1, r1)) = self.selection {
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    self.grid.set_committed(c, r, BLANK);
+                }
+            }
+            self.clear_selection();
+        } else {
+            for cell in self.grid.committed.iter_mut() {
+                *cell = BLANK;
+            }
+        }
+        self.render_all();
+    }
+
     // ── Undo / redo ──────────────────────────────────────────────────────────
 
     /// Snapshot committed state onto the undo stack before a destructive commit.
@@ -571,6 +698,7 @@ impl App {
 
     /// Restore the previous committed state.
     pub(crate) fn undo(&mut self) {
+        self.commit_text_session(); // commit any open text entry before undoing
         if let Some(prev) = self.undo_stack.pop() {
             self.redo_stack.push(self.grid.committed.clone());
             self.grid.committed = prev;
@@ -583,6 +711,7 @@ impl App {
 
     /// Reapply a previously undone state.
     pub(crate) fn redo(&mut self) {
+        self.commit_text_session(); // commit any open text entry before redoing
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack.push(self.grid.committed.clone());
             self.grid.committed = next;
@@ -675,6 +804,140 @@ impl App {
         self.grid_el
             .set_attribute("style", &format!("font-size: {}px", self.font_size))
             .unwrap();
+    }
+
+    // ── Text entry ───────────────────────────────────────────────────────────
+
+    /// Internal: position the cursor at (col, row) and push an undo snapshot.
+    /// Does NOT commit any existing session — callers must do that first.
+    fn start_text_session_at(&mut self, col: usize, row: usize) {
+        self.push_undo_snapshot();
+        self.text_cursor = Some((col, row));
+        self.text_origin = Some((col, row));
+        if col < COLS {
+            self.grid.set_preview(col, row, Some(CURSOR_CHAR));
+            self.render_cell(col, row);
+            self.cell_els[Grid::idx(col, row)].class_list().add_1("cursor").unwrap();
+        }
+        // Focus the hidden input to raise the mobile virtual keyboard.
+        // Must be called inside a user-gesture handler (mousedown / touchstart / touchend)
+        // for the browser to honour it; callers guarantee that invariant.
+        let _ = self.text_input_el.focus();
+    }
+
+    /// Begin a text session at (col, row), committing any existing session first.
+    /// Called from mousedown/touchstart when the text tool is active.
+    pub(crate) fn start_text_session(&mut self, col: usize, row: usize) {
+        if self.text_origin.is_some() {
+            self.commit_text_session();
+        }
+        self.start_text_session_at(col, row);
+    }
+
+    /// Finalise the text session: strip the cursor glyph and commit all typed
+    /// characters to the backing store. Safe to call when no session is active.
+    pub(crate) fn commit_text_session(&mut self) {
+        if self.text_origin.is_none() {
+            return; // no session active
+        }
+        // Strip the cursor glyph from the preview so it doesn't land on the canvas.
+        if let Some((col, row)) = self.text_cursor {
+            if col < COLS {
+                self.grid.set_preview(col, row, None);
+                self.cell_els[Grid::idx(col, row)].class_list().remove_1("cursor").unwrap();
+                self.render_cell(col, row);
+            }
+        }
+        let dirty = self.grid.commit_preview();
+        for (c, r) in dirty {
+            self.render_cell(c, r);
+        }
+        self.text_cursor = None;
+        self.text_origin = None;
+        // Dismiss the mobile keyboard and clear any buffered input.
+        self.text_input_el.set_value("");
+        let _ = self.text_input_el.blur();
+    }
+
+    /// Cancel the text session: discard all provisional characters, remove the
+    /// cursor, pop the session's undo snapshot, and restart the cursor at the
+    /// session origin. Called on ESC.
+    pub(crate) fn abort_text_session(&mut self) {
+        if self.text_origin.is_none() {
+            return;
+        }
+        if let Some((col, row)) = self.text_cursor {
+            if col < COLS {
+                self.cell_els[Grid::idx(col, row)].class_list().remove_1("cursor").unwrap();
+            }
+        }
+        let dirty = self.grid.abort_preview();
+        for (c, r) in dirty {
+            self.render_cell(c, r);
+        }
+        self.undo_stack.pop(); // discard pre-session snapshot — typing was cancelled
+        let origin = self.text_origin;
+        self.text_cursor = None;
+        self.text_origin = None;
+        // Clear any buffered input before restarting the session.
+        self.text_input_el.set_value("");
+        if let Some((oc, or)) = origin {
+            self.start_text_session_at(oc, or); // reposition cursor at session start; refocuses
+        }
+    }
+
+    /// Place a character at the cursor position and advance the cursor right.
+    /// If the cursor reaches the right edge the visual cursor disappears but
+    /// the session stays alive (Enter or tool-switch will commit, ESC will abort).
+    pub(crate) fn type_char(&mut self, ch: char) {
+        let (col, row) = match self.text_cursor {
+            Some(cr) if cr.0 < COLS => cr,
+            _ => return, // past end of row or no session
+        };
+        // Replace cursor glyph with the typed character.
+        self.cell_els[Grid::idx(col, row)].class_list().remove_1("cursor").unwrap();
+        self.grid.set_preview(col, row, Some(ch));
+        self.render_cell(col, row);
+        // Advance cursor.
+        let next_col = col + 1;
+        if next_col < COLS {
+            self.grid.set_preview(next_col, row, Some(CURSOR_CHAR));
+            self.render_cell(next_col, row);
+            self.cell_els[Grid::idx(next_col, row)].class_list().add_1("cursor").unwrap();
+            self.text_cursor = Some((next_col, row));
+        } else {
+            // End of row: visual cursor disappears, session stays alive.
+            self.text_cursor = Some((COLS, row));
+        }
+    }
+
+    /// Erase the last typed character and retreat the cursor one position.
+    /// Does nothing when the cursor is at or before the session origin.
+    pub(crate) fn text_backspace(&mut self) {
+        let (col, row) = match self.text_cursor {
+            Some(cr) => cr,
+            None => return,
+        };
+        let origin_col = match self.text_origin {
+            Some((oc, _)) => oc,
+            None => return,
+        };
+        if col <= origin_col {
+            return; // at or before session start — nothing to erase
+        }
+        // Remove visual cursor from current position (only if within canvas bounds).
+        if col < COLS {
+            self.cell_els[Grid::idx(col, row)].class_list().remove_1("cursor").unwrap();
+            self.grid.set_preview(col, row, None);
+            self.render_cell(col, row);
+        }
+        // Move cursor back and overwrite the previous character with the cursor glyph.
+        // On commit the cursor glyph is stripped, leaving that cell blank (erased).
+        let prev_col = col - 1;
+        self.grid.set_preview(prev_col, row, Some(CURSOR_CHAR));
+        self.render_cell(prev_col, row);
+        self.cell_els[Grid::idx(prev_col, row)].class_list().add_1("cursor").unwrap();
+        self.text_cursor = Some((prev_col, row));
     }
 }
 
@@ -769,50 +1032,19 @@ fn build_palette(document: &Document) {
     }
 }
 
-/// Create the `#mode-dropdown` fly-out and append it to `#toolbar`.
-/// The dropdown is hidden by default (no `.open` class); `wire_blend_mode`
-/// toggles visibility in response to mousedown / mouseup.
-fn build_blend_mode_control(document: &Document) {
-    let toolbar = document
-        .get_element_by_id("toolbar")
-        .expect("#toolbar must exist in HTML");
-
-    let dropdown = document.create_element("div").unwrap();
-    dropdown.set_attribute("id", "mode-dropdown").unwrap();
-
-    // One tile per blend mode — Overwrite starts selected (matches App default).
-    let modes: &[(&str, &str, &str, bool)] = &[
-        ("overwrite",  "▊", "Overwrite — replace any cell",   true),
-        ("stamp",      "⬚", "Stamp — paint only blank cells", false),
-        ("combine",    "┼", "Combine (NIY)",                  false),
-        ("difference", "∖", "Difference (NIY)",               false),
-    ];
-
-    for &(mode_id, icon, title, initially_selected) in modes {
-        let tile = document.create_element("div").unwrap();
-        tile.set_class_name(if initially_selected {
-            "mode-tile selected"
-        } else {
-            "mode-tile"
-        });
-        tile.set_attribute("data-mode", mode_id).unwrap();
-        tile.set_attribute("title", title).unwrap();
-        tile.set_text_content(Some(icon));
-        dropdown.append_child(&tile).unwrap();
-    }
-
-    toolbar.append_child(&dropdown).unwrap();
-}
 
 /// Return every (col, row) on the ellipse outline inscribed in bounding box
 /// (bx0,by0)–(bx1,by1), using the Zingl-Bresenham integer algorithm.
 /// No floating point or trig. Handles even/odd dimensions and degenerate
 /// cases (single cell, horizontal/vertical line).
-fn ellipse_cells(bx0: usize, by0: usize, bx1: usize, by1: usize) -> Vec<(usize, usize)> {
+/// Accepts signed coordinates so center-origin mode can produce negative bounding
+/// box corners without clamping (which would distort the ellipse). The `push!`
+/// macro clips any out-of-canvas cells before they reach the caller.
+fn ellipse_cells(bx0: i64, by0: i64, bx1: i64, by1: i64) -> Vec<(usize, usize)> {
     let mut cells: Vec<(usize, usize)> = Vec::new();
 
-    let (mut x0, mut y0) = (bx0 as i64, by0 as i64);
-    let (mut x1, mut y1) = (bx1 as i64, by1 as i64);
+    let (mut x0, mut y0) = (bx0, by0);
+    let (mut x1, mut y1) = (bx1, by1);
 
     if x0 > x1 { std::mem::swap(&mut x0, &mut x1); }
     if y0 > y1 { std::mem::swap(&mut y0, &mut y1); }
@@ -868,6 +1100,78 @@ fn ellipse_cells(bx0: usize, by0: usize, bx1: usize, by1: usize) -> Vec<(usize, 
     cells
 }
 
+/// Filled ellipse using the same Zingl-Bresenham stepper as `ellipse_cells`.
+///
+/// At each step the stepper knows the left (x0) and right (x1) extent at the
+/// current pair of rows (y0 upper, y1 lower). We fill the full horizontal span
+/// [x0, x1] at each row instead of just plotting the two edge points, so the
+/// interior is derived from exactly the same integer geometry as the outline.
+/// This guarantees zero gaps or overlaps when outline and fill use different
+/// characters in future.
+///
+/// Spans are clipped to the canvas; out-of-canvas rows are skipped entirely.
+fn filled_ellipse_cells(bx0: i64, by0: i64, bx1: i64, by1: i64) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+
+    let (mut x0, mut y0) = (bx0, by0);
+    let (mut x1, mut y1) = (bx1, by1);
+
+    if x0 > x1 { std::mem::swap(&mut x0, &mut x1); }
+    if y0 > y1 { std::mem::swap(&mut y0, &mut y1); }
+
+    let a = x1 - x0;
+    let b = y1 - y0;
+    let b_odd = b & 1;
+
+    let mut dx = 4 * (1 - a) * b * b;
+    let mut dy = 4 * (b_odd + 1) * a * a;
+    let mut err = dx + dy + b_odd * a * a;
+
+    y0 += (b + 1) / 2;
+    y1  = y0 - b_odd;
+
+    let da = 8 * a * a;
+    let db = 8 * b * b;
+
+    // Fill [xl, xr] on row py, clipping to canvas bounds.
+    // xl > xr produces an empty range and is silently skipped.
+    macro_rules! fill_span {
+        ($py:expr, $xl:expr, $xr:expr) => {{
+            let (py, xl, xr): (i64, i64, i64) = ($py, $xl, $xr);
+            if py >= 0 && (py as usize) < ROWS && xl <= xr {
+                let x_lo = xl.max(0) as usize;
+                let x_hi = xr.min(COLS as i64 - 1);
+                if x_hi >= 0 {
+                    for px in x_lo..=(x_hi as usize) {
+                        cells.push((px, py as usize));
+                    }
+                }
+            }
+        }};
+    }
+
+    loop {
+        fill_span!(y0, x0, x1); // upper half span
+        fill_span!(y1, x0, x1); // lower half span (same row as y0 when b is even)
+
+        let e2 = 2 * err;
+        if e2 <= dy                  { y0 += 1; y1 -= 1; dy += da; err += dy; }
+        if e2 >= dx || 2 * err > dy  { x0 += 1; x1 -= 1; dx += db; err += dx; }
+
+        if x0 > x1 { break; }
+    }
+
+    // Flat-ellipse correction: fill the remaining tip rows not covered by the main loop.
+    while y0 - y1 <= b {
+        fill_span!(y0, x0 - 1, x1 + 1);
+        y0 += 1;
+        fill_span!(y1, x0 - 1, x1 + 1);
+        y1 -= 1;
+    }
+
+    cells
+}
+
 /// Map a Bresenham step direction vector to the ASCII art character that best
 /// represents it. Covers all four axis-aligned and diagonal cases.
 fn art_char(dc: i32, dr: i32) -> char {
@@ -879,37 +1183,6 @@ fn art_char(dc: i32, dr: i32) -> char {
     }
 }
 
-/// Create the `#line-mode-dropdown` fly-out and append it to the `.tool-row`
-/// that contains `#line-tool-btn`. Anchoring to the row (not the toolbar root)
-/// makes `left: 100%; top: 0` position the fly-out beside that specific row.
-fn build_line_mode_control(document: &Document) {
-    let line_btn = document
-        .get_element_by_id("line-tool-btn")
-        .expect("#line-tool-btn must exist in HTML");
-    let toolbar = line_btn
-        .parent_element()
-        .expect("#line-tool-btn must have a parent element");
-
-    let dropdown = document.create_element("div").unwrap();
-    dropdown.set_attribute("id", "line-mode-dropdown").unwrap();
-
-    // Character mode starts selected (matches App default).
-    let modes: &[(&str, &str, &str, bool)] = &[
-        ("character", "╲",  "Character — stamp brush char along path", true),
-        ("art",       "📐", "Art — use - | \\ / for geometry",          false),
-    ];
-
-    for &(mode_id, icon, title, initially_selected) in modes {
-        let tile = document.create_element("div").unwrap();
-        tile.set_class_name(if initially_selected { "mode-tile selected" } else { "mode-tile" });
-        tile.set_attribute("data-line-mode", mode_id).unwrap();
-        tile.set_attribute("title", title).unwrap();
-        tile.set_text_content(Some(icon));
-        dropdown.append_child(&tile).unwrap();
-    }
-
-    toolbar.append_child(&dropdown).unwrap();
-}
 
 // ── Demo content ─────────────────────────────────────────────────────────────
 
@@ -944,6 +1217,9 @@ fn draw_demo(app: &mut App) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Build timestamp injected by build.rs — format "Build: MMDD:HHMM".
+const BUILD_TS: &str = env!("BUILD_TIMESTAMP");
+
 /// Called automatically by the generated JS glue when `init()` is awaited.
 /// Builds the DOM, initialises application state, wires all event handlers.
 #[wasm_bindgen(start)]
@@ -957,12 +1233,20 @@ pub fn start() {
     // Build the dynamic DOM sections that Rust owns
     let cell_els = build_grid(&document);
     build_palette(&document);
-    build_blend_mode_control(&document);
-    build_line_mode_control(&document);
 
     // Initialise shared application state (shared via Rc<RefCell> across closures)
     let grid_el = document.get_element_by_id("grid").unwrap();
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el)));
+    let text_input_el = document
+        .get_element_by_id("text-input")
+        .expect("#text-input must exist in HTML")
+        .dyn_into::<HtmlInputElement>()
+        .expect("#text-input must be an <input> element");
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el)));
+
+    // Stamp the build time below the canvas so the version is always visible.
+    if let Some(el) = document.get_element_by_id("build-info") {
+        el.set_text_content(Some(BUILD_TS));
+    }
 
     // Populate the canvas with demo content to prove the pipeline end-to-end
     draw_demo(&mut app.borrow_mut());
@@ -976,5 +1260,8 @@ pub fn start() {
     wire_blend_mode(&document, &app);
     wire_line_tool(&document, &app);
     wire_copy(&document, &app);
+    wire_clear(&document, &app);
     wire_touch(&document, &app);
+    wire_shift_toggle(&document, &app);
+    wire_text_input(&document, &app);
 }

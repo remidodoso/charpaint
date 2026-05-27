@@ -31,6 +31,7 @@ features = [
   "Event",         # prevent_default, target (inherited by MouseEvent)
   "EventTarget",   # add_event_listener_with_callback (inherited by Element, Window)
   "HtmlElement",   # general HtmlElement access
+  "HtmlInputElement", # hidden input for mobile keyboard capture (text tool)
   "MouseEvent",    # type for mouse event handlers
   "Node",          # append_child, set_text_content
   "NodeList",      # item(), length() — result of query_selector_all
@@ -42,3 +43,7 @@ features = [
   "TouchList",     # collection of Touch objects (e.touches(), etc.)
   "DomRect",       # bounding rect returned by getBoundingClientRect — used for pinch-zoom scroll correction
 ]
+
+# chrono runs only on the host at compile time (build.rs) — never touches the WASM output.
+[build-dependencies]
+chrono = { version = "0.4", features = ["clock"] }

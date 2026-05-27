@@ -9,12 +9,12 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, KeyboardEvent, MouseEvent, NodeList, TouchEvent, Window};
+use web_sys::{Document, Element, Event, KeyboardEvent, MouseEvent, NodeList, TouchEvent, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
-use crate::{App, BlendMode, LineMode, Tool};
-use crate::util::{cell_from_coords, cell_from_mouse_event, flash_button, flash_button_error, wire_long_press};
+use crate::{App, Tool};
+use crate::util::{cell_from_coords, cell_from_mouse_event, flash_button, flash_button_error};
 
 /// Attach mouse handlers to `#grid` and a global mouseup handler to `window`.
 ///
@@ -31,6 +31,11 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
             e.prevent_default(); // suppress browser text-selection during drag
             if let Some((col, row)) = cell_from_mouse_event(&e) {
                 let mut a = app.borrow_mut();
+                // Text tool: start (or move) the text session; no stroke state needed.
+                if a.tool == Tool::Text {
+                    a.start_text_session(col, row);
+                    return;
+                }
                 // Select doesn't modify the canvas so needs no undo snapshot.
                 // All other tools snapshot before the stroke so Ctrl+Z can restore.
                 if a.tool != Tool::Select {
@@ -104,7 +109,7 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
             None => continue,
         };
 
-        // Line tool has sub-modes and uses long-press; wired separately by wire_line_tool.
+        // Line tool has sub-modes and tap-to-cycle; wired separately by wire_line_tool.
         if tool == Tool::Line { continue; }
 
         let app       = Rc::clone(app);
@@ -114,12 +119,15 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
         let cb = Closure::<dyn FnMut()>::new(move || {
             {
                 let mut a = app.borrow_mut();
-                a.clear_selection(); // switching tools always drops any active selection
+                a.commit_text_session(); // commit any open text entry before switching tools
+                a.clear_selection();     // switching tools always drops any active selection
                 a.tool = tool;
             }
 
-            // Move the `active` CSS class to the clicked button
-            let all = doc_clone.query_selector_all(".tool").unwrap();
+            // Move the `active` CSS class to the clicked button.
+            // Only sweep [data-tool] elements — shift-toggle and mode-btn use .tool
+            // for styling but are independent toggles, not tool-selector buttons.
+            let all = doc_clone.query_selector_all("[data-tool]").unwrap();
             for j in 0..all.length() {
                 let t: Element = all.item(j).unwrap().dyn_into().unwrap();
                 t.class_list().remove_1("active").unwrap();
@@ -202,7 +210,8 @@ pub fn wire_undo_redo(document: &Document, app: &Rc<RefCell<App>>) {
         cb.forget();
     }
 
-    // Keyboard: Ctrl+Z → undo, Shift+Ctrl+Z → redo, Escape → abort stroke.
+    // Keyboard: Ctrl+Z → undo, Shift+Ctrl+Z → redo, Escape → abort stroke or text.
+    // Text session keys (printable chars, Backspace, Enter) are intercepted first.
     // Listening on window so it works regardless of which element has focus.
     {
         let window: Window = web_sys::window().unwrap();
@@ -211,25 +220,53 @@ pub fn wire_undo_redo(document: &Document, app: &Rc<RefCell<App>>) {
         let btn_undo = document.get_element_by_id("btn-undo");
         let btn_redo = document.get_element_by_id("btn-redo");
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-            match e.key().as_str() {
-                "z" | "Z" if e.ctrl_key() => {
-                    e.prevent_default(); // suppress browser's own undo in editable fields
-                    if e.shift_key() {
-                        app.borrow_mut().redo();
-                        if let Some(ref el) = btn_redo { flash_button(el); }
-                    } else {
-                        app.borrow_mut().undo();
-                        if let Some(ref el) = btn_undo { flash_button(el); }
+            let key = e.key();
+
+            // Text session: intercept typing before standard shortcuts.
+            {
+                let text_active = app.borrow().text_origin.is_some();
+                if text_active {
+                    if key == "Escape" {
+                        // ESC during text: discard typed chars, cursor returns to origin.
+                        app.borrow_mut().abort_text_session();
+                        return;
+                    }
+                    if key == "Enter" {
+                        // Enter: commit typed text, end session.
+                        app.borrow_mut().commit_text_session();
+                        return;
+                    }
+                    if key == "Backspace" && !e.ctrl_key() && !e.alt_key() {
+                        e.prevent_default();
+                        app.borrow_mut().text_backspace();
+                        return;
+                    }
+                    // Single printable character — route to text input.
+                    if key.chars().count() == 1 && !e.ctrl_key() && !e.alt_key() {
+                        e.prevent_default();
+                        let ch = key.chars().next().unwrap();
+                        app.borrow_mut().type_char(ch);
+                        return;
                     }
                 }
-                "Escape" => {
-                    // Cancel any in-progress stroke — preview discarded, no undo entry.
-                    let mut a = app.borrow_mut();
-                    if a.is_drawing {
-                        a.abort_stroke();
-                    }
+            }
+
+            // Standard global shortcuts.
+            if (key == "z" || key == "Z") && e.ctrl_key() {
+                e.prevent_default(); // suppress browser's own undo in editable fields
+                if e.shift_key() {
+                    app.borrow_mut().redo();
+                    if let Some(ref el) = btn_redo { flash_button(el); }
+                } else {
+                    app.borrow_mut().undo();
+                    if let Some(ref el) = btn_undo { flash_button(el); }
                 }
-                _ => {}
+            } else if key == "Escape" {
+                // Cancel any in-progress stroke — preview discarded, no undo entry.
+                let mut a = app.borrow_mut();
+                if a.is_drawing {
+                    a.abort_stroke();
+                }
             }
         });
         window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref()).unwrap();
@@ -270,91 +307,69 @@ pub fn wire_theme_toggle(document: &Document, app: &Rc<RefCell<App>>) {
     cb.forget();
 }
 
-/// Wire the blend mode fly-out control.
+/// Wire the `#mode-btn` blend-mode button.
 ///
-/// Interaction: mousedown on `#mode-btn` opens the dropdown; the user drags to
-/// a tile; mouseup on a tile selects that mode. Mouseup anywhere else dismisses
-/// without changing mode. No ESC handling — the window mouseup always closes it.
+/// Tap-to-cycle: each tap advances to the next implemented blend mode
+/// (Overwrite → Stamp → Overwrite). The button icon and title update to reflect
+/// the new mode. The mode button is never "selected" — it has no active state.
+///
+/// Three listeners — same touch/mouse pattern used by `wire_shift_toggle`:
+///   touchstart — preventDefault to suppress synthetic mouse event chain.
+///   touchend   — cycle for touch.
+///   mousedown  — cycle for desktop mouse, with coordinate guard.
 pub fn wire_blend_mode(document: &Document, app: &Rc<RefCell<App>>) {
-    let mode_btn = match document.get_element_by_id("mode-btn") {
+    let btn = match document.get_element_by_id("mode-btn") {
         Some(el) => el,
         None => return,
     };
 
-    // mousedown on the mode tile → show the fly-out
+    // touchstart — suppress synthetic mouse events from this button's tap.
     {
-        let app = Rc::clone(app);
-        let doc_clone = document.clone();
-        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            e.prevent_default(); // suppress text-selection during drag
-            app.borrow_mut().mode_dropdown_open = true;
-            if let Some(dd) = doc_clone.get_element_by_id("mode-dropdown") {
-                dd.class_list().add_1("open").unwrap();
-            }
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
         });
-        mode_btn
-            .add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref())
-            .unwrap();
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
 
-    // window mouseup → close dropdown and commit selection if over a mode tile.
-    // Coexists with the wire_grid_mouse window mouseup; each checks its own flag.
+    // touchend — cycle blend mode for touch devices.
     {
-        let window = web_sys::window().unwrap();
-        let app = Rc::clone(app);
-        let doc_clone = document.clone();
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            let mode = {
+                let mut a = app.borrow_mut();
+                a.blend_mode = a.blend_mode.cycle();
+                a.blend_mode
+            };
+            btn_clone.set_text_content(Some(mode.icon()));
+            btn_clone.set_attribute("title", &format!("Blend mode: {}", mode.name())).unwrap();
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — cycle blend mode for desktop mouse.
+    // Coordinate guard rejects rerouted synthetic events from Firefox Android.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            let mut a = app.borrow_mut();
-            if !a.mode_dropdown_open {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
                 return;
             }
-            a.mode_dropdown_open = false;
-
-            // Hide dropdown regardless of where the mouse was released
-            if let Some(dd) = doc_clone.get_element_by_id("mode-dropdown") {
-                dd.class_list().remove_1("open").unwrap();
-            }
-
-            // Check if the release landed on a mode tile (or a child of one)
-            let target: Option<Element> = e.target().and_then(|t| t.dyn_into().ok());
-            let tile = target.and_then(|el| {
-                if el.class_list().contains("mode-tile") {
-                    Some(el)
-                } else {
-                    el.closest(".mode-tile").ok().flatten()
-                }
-            });
-
-            if let Some(tile_el) = tile {
-                let mode_str = tile_el.get_attribute("data-mode").unwrap_or_default();
-                if let Some(mode) = BlendMode::from_data_attr(&mode_str) {
-                    a.blend_mode = mode;
-
-                    // Update the mode button icon so it always shows the active mode
-                    if let Some(btn) = doc_clone.get_element_by_id("mode-btn") {
-                        btn.set_text_content(Some(mode.icon()));
-                        btn.set_attribute(
-                            "title",
-                            &format!("Blend mode: {}", mode_str),
-                        )
-                        .unwrap();
-                    }
-
-                    // Move `selected` highlight to the newly chosen blend mode tile.
-                    // Scoped to [data-mode] so line-mode tiles are not affected.
-                    let tiles = doc_clone.query_selector_all("[data-mode]").unwrap();
-                    for i in 0..tiles.length() {
-                        let t: Element = tiles.item(i).unwrap().dyn_into().unwrap();
-                        t.class_list().remove_1("selected").unwrap();
-                    }
-                    tile_el.class_list().add_1("selected").unwrap();
-                }
-            }
+            let mode = {
+                let mut a = app.borrow_mut();
+                a.blend_mode = a.blend_mode.cycle();
+                a.blend_mode
+            };
+            btn_clone.set_text_content(Some(mode.icon()));
+            btn_clone.set_attribute("title", &format!("Blend mode: {}", mode.name())).unwrap();
         });
-        window
-            .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
-            .unwrap();
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
 }
@@ -456,114 +471,181 @@ pub fn wire_copy(document: &Document, app: &Rc<RefCell<App>>) {
     }
 }
 
-/// Wire the line mode fly-out (╲ / 📐 tile in the toolbar).
-/// Wire the line tool button with long-press mode selection.
-/// Quick click → activate Tool::Line. Hold 400ms → open the line mode fly-out.
-/// Window mouseup commits the chosen mode tile and updates the button icon.
+/// Wire the `#line-tool-btn` line-tool button.
+///
+/// Tap-to-select, tap-again-to-cycle:
+///   • First tap when the line tool is not active: activates the line tool.
+///   • Second tap when already active: cycles LineMode (Character → Art → Character)
+///     and updates the button icon. The tool stays active.
+///
+/// Three listeners — same touch/mouse pattern used by `wire_shift_toggle`:
+///   touchstart — preventDefault to suppress synthetic mouse event chain.
+///   touchend   — select-or-cycle for touch.
+///   mousedown  — select-or-cycle for desktop mouse, with coordinate guard.
 pub fn wire_line_tool(document: &Document, app: &Rc<RefCell<App>>) {
     let btn = match document.get_element_by_id("line-tool-btn") {
         Some(el) => el,
         None => return,
     };
 
-    let app_click = Rc::clone(app);
-    let app_lp    = Rc::clone(app);
-    let doc_click = document.clone();
-    let doc_lp    = document.clone();
-    let btn_click = btn.clone();
-
-    wire_long_press(
-        &btn,
-        // on_click: activate the line tool, move .active class
-        move || {
-            {
-                let mut a = app_click.borrow_mut();
-                a.clear_selection();
-                a.tool = Tool::Line;
-            }
-            let all = doc_click.query_selector_all(".tool").unwrap();
-            for j in 0..all.length() {
-                let t: Element = all.item(j).unwrap().dyn_into().unwrap();
-                t.class_list().remove_1("active").unwrap();
-            }
-            btn_click.class_list().add_1("active").unwrap();
-        },
-        // on_long_press: open the mode fly-out
-        move || {
-            app_lp.borrow_mut().line_mode_dropdown_open = true;
-            if let Some(dd) = doc_lp.get_element_by_id("line-mode-dropdown") {
-                dd.class_list().add_1("open").unwrap();
-            }
-        },
-    );
-
-    // window mouseup → close dropdown and commit the chosen mode tile.
-    // If the user released over a tile: set mode, activate line tool, update icon.
-    // If the user dragged off without landing on a tile: dismiss without activating.
+    // touchstart — suppress synthetic mouse events from this button's tap.
     {
-        let window    = web_sys::window().unwrap();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — select-or-cycle for touch devices.
+    {
         let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
         let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            line_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — select-or-cycle for desktop mouse.
+    // Coordinate guard rejects rerouted synthetic events from Firefox Android.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            line_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Shared action for touch and mouse line-tool taps.
+/// First tap (tool inactive): selects the line tool and moves `.active`.
+/// Second tap (tool already active): cycles LineMode and updates icon/title.
+fn line_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
+    let already_active = app.borrow().tool == Tool::Line;
+
+    if already_active {
+        let mode = {
+            let mut a = app.borrow_mut();
+            a.line_mode = a.line_mode.cycle();
+            a.line_mode
+        };
+        btn.set_text_content(Some(mode.icon()));
+        btn.set_attribute("title", &format!("Line ({}) — tap again to cycle mode", mode.icon())).unwrap();
+    } else {
+        {
+            let mut a = app.borrow_mut();
+            a.commit_text_session(); // commit any open text entry before switching to line tool
+            a.clear_selection();
+            a.tool = Tool::Line;
+        }
+        let all = document.query_selector_all("[data-tool]").unwrap();
+        for j in 0..all.length() {
+            let t: Element = all.item(j).unwrap().dyn_into().unwrap();
+            t.class_list().remove_1("active").unwrap();
+        }
+        btn.class_list().add_1("active").unwrap();
+    }
+}
+
+/// Wire the ⌧ clear button.
+/// Clears the active selection's content if one exists, otherwise clears the full
+/// canvas. Always undoable — a snapshot is pushed before any change is made.
+pub fn wire_clear(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("btn-clear") {
+        Some(el) => el,
+        None => return,
+    };
+    let app = Rc::clone(app);
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        app.borrow_mut().clear_canvas();
+    });
+    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+    cb.forget();
+}
+
+/// Wire the ⇧ shift-lock toggle button.
+/// Tapping it toggles `app.shift_locked`, which ORs with the physical Shift key
+/// in `resolve_target` so axis constraint works on touch devices without a keyboard.
+///
+/// Three listeners rather than one `click`:
+///   touchstart — calls preventDefault() so the browser does not synthesise a
+///                mousedown+click after the tap (which would double-fire the toggle).
+///   touchend   — fires the toggle for touch devices.
+///   mousedown  — fires the toggle for desktop mouse.
+///
+/// `click` is intentionally NOT used. Firefox Android reroutes synthetic click
+/// events from touches on non-interactive areas (blank canvas, etc.) to the
+/// nearest element that has a `click` listener. Removing the `click` listener
+/// from this button eliminates it as a rerouting target entirely.
+pub fn wire_shift_toggle(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("shift-toggle") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse event chain from this button's tap.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — toggle for touch devices.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            let mut a = app.borrow_mut();
+            a.shift_locked = !a.shift_locked;
+            if a.shift_locked {
+                btn_clone.class_list().add_1("active").unwrap();
+            } else {
+                btn_clone.class_list().remove_1("active").unwrap();
+            }
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — toggle for desktop mouse.
+    // Guard: check that the event coordinates actually land inside the button.
+    // Firefox Android reroutes synthetic mousedown events (manufactured from canvas
+    // touches) to the nearest element with a mousedown listener. The rerouted event
+    // carries the touch's original coordinates — outside this button — so the check
+    // rejects it. A genuine mouse press will always have coordinates inside the button.
+    {
+        let app       = Rc::clone(app);
         let btn_clone = btn.clone();
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-            {
-                let mut a = app.borrow_mut();
-                if !a.line_mode_dropdown_open { return; }
-                a.line_mode_dropdown_open = false;
-            } // release borrow before DOM work
-
-            if let Some(dd) = doc_clone.get_element_by_id("line-mode-dropdown") {
-                dd.class_list().remove_1("open").unwrap();
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return; // rerouted synthetic event — coordinates aren't on this button
             }
-
-            let target: Option<Element> = e.target().and_then(|t| t.dyn_into().ok());
-            let tile = target.and_then(|el| {
-                if el.get_attribute("data-line-mode").is_some() {
-                    Some(el)
-                } else {
-                    el.closest("[data-line-mode]").ok().flatten()
-                }
-            });
-
-            if let Some(tile_el) = tile {
-                let mode_str = tile_el.get_attribute("data-line-mode").unwrap_or_default();
-                if let Some(mode) = LineMode::from_data_attr(&mode_str) {
-                    // Commit mode and activate the line tool (long-press + tile = tool select).
-                    {
-                        let mut a = app.borrow_mut();
-                        a.line_mode = mode;
-                        a.clear_selection();
-                        a.tool = Tool::Line;
-                    }
-
-                    // Move .active to the line tool button
-                    let all = doc_clone.query_selector_all(".tool").unwrap();
-                    for i in 0..all.length() {
-                        let t: Element = all.item(i).unwrap().dyn_into().unwrap();
-                        t.class_list().remove_1("active").unwrap();
-                    }
-                    btn_clone.class_list().add_1("active").unwrap();
-
-                    // Update button icon and title to reflect the chosen mode
-                    btn_clone.set_text_content(Some(mode.icon()));
-                    btn_clone
-                        .set_attribute("title", &format!("Line ({}) — hold for mode", mode.icon()))
-                        .unwrap();
-
-                    // Move `selected` highlight to the chosen tile
-                    let tiles = doc_clone.query_selector_all("[data-line-mode]").unwrap();
-                    for i in 0..tiles.length() {
-                        let t: Element = tiles.item(i).unwrap().dyn_into().unwrap();
-                        t.class_list().remove_1("selected").unwrap();
-                    }
-                    tile_el.class_list().add_1("selected").unwrap();
-                }
+            let mut a = app.borrow_mut();
+            a.shift_locked = !a.shift_locked;
+            if a.shift_locked {
+                btn_clone.class_list().add_1("active").unwrap();
+            } else {
+                btn_clone.class_list().remove_1("active").unwrap();
             }
-            // No tile → user dragged off without selecting; line tool stays inactive.
         });
-        window
-            .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
-            .unwrap();
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
 }
@@ -593,6 +675,11 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
         let app = Rc::clone(app);
         let doc = document.clone();
         let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            // Suppress synthetic mouse/click events — we drive all drawing from
+            // touch events directly. Without this, Firefox Android synthesises a
+            // mousedown+mouseup+click chain after each touch and can reroute the
+            // click to unrelated elements with click listeners (e.g. #shift-toggle).
+            e.prevent_default();
             let touches = e.touches();
             match touches.length() {
                 1 => {
@@ -606,6 +693,13 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                     if let Some((col, row)) = cell_from_coords(
                         t.client_x() as f64, t.client_y() as f64, &doc,
                     ) {
+                        // Text tool: start/move session; start_text_session_at calls
+                        // focus() to raise the mobile keyboard. touchstart is a user
+                        // gesture so the browser honours the focus() call.
+                        if a.tool == Tool::Text {
+                            a.start_text_session(col, row);
+                            return;
+                        }
                         if a.tool != Tool::Select {
                             a.push_undo_snapshot();
                         }
@@ -760,4 +854,33 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
             .unwrap();
         cb.forget();
     }
+}
+
+/// Wire the hidden `#text-input` element to capture mobile virtual keyboard input.
+///
+/// When the text tool is active, Rust focuses this element (raising the keyboard).
+/// Each `input` event means the user typed something — we read `.value()`, route
+/// each character to `type_char()`, then clear the value so the next event is fresh.
+///
+/// Desktop typing is handled by the window `keydown` handler in `wire_undo_redo`,
+/// which calls `e.prevent_default()` on printable keys — that suppresses the
+/// `input` event on desktop, so there is no double-fire.
+pub fn wire_text_input(document: &Document, app: &Rc<RefCell<App>>) {
+    let el = match document.get_element_by_id("text-input") {
+        Some(el) => el,
+        None => return,
+    };
+    let app = Rc::clone(app);
+    let cb = Closure::<dyn FnMut(Event)>::new(move |_e: Event| {
+        // Read and immediately clear the input value.
+        // Each `input` event carries exactly the newly inserted text.
+        let value = app.borrow().text_input_el.value();
+        if value.is_empty() { return; }
+        app.borrow().text_input_el.set_value("");
+        for ch in value.chars() {
+            app.borrow_mut().type_char(ch);
+        }
+    });
+    el.add_event_listener_with_callback("input", cb.as_ref().unchecked_ref()).unwrap();
+    cb.forget();
 }

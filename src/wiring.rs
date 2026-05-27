@@ -31,6 +31,7 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
             e.prevent_default(); // suppress browser text-selection during drag
             if let Some((col, row)) = cell_from_mouse_event(&e) {
                 let mut a = app.borrow_mut();
+                a.clear_demo_if_active(); // wipe intro content before first undo snapshot
                 // Text tool: start (or move) the text session; no stroke state needed.
                 if a.tool == Tool::Text {
                     a.start_text_session(col, row);
@@ -693,6 +694,7 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                     if let Some((col, row)) = cell_from_coords(
                         t.client_x() as f64, t.client_y() as f64, &doc,
                     ) {
+                        a.clear_demo_if_active(); // wipe intro content before first undo snapshot
                         // Text tool: start/move session; start_text_session_at calls
                         // focus() to raise the mobile keyboard. touchstart is a user
                         // gesture so the browser honours the focus() call.

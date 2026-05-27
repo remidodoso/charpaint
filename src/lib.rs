@@ -243,6 +243,12 @@ pub(crate) struct App {
     /// States available for redo. Populated by undo(); cleared by new commits.
     redo_stack: Vec<Vec<char>>,
 
+    /// True until the user first touches the canvas. While true, the demo
+    /// content drawn by draw_demo() is still showing. Cleared by
+    /// clear_demo_if_active() which is called at the top of every mousedown
+    /// and touchstart handler so the demo is never captured in undo history.
+    pub(crate) demo_active: bool,
+
     pub(crate) shift_locked: bool,       // true when the ⇧ toggle is active (axis constraint)
     pub(crate) dark_mode: bool,
     pub(crate) blend_mode: BlendMode, // how new paint interacts with existing cells
@@ -286,6 +292,7 @@ impl App {
             last_painted_cell: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            demo_active: true,
             shift_locked: false,
             dark_mode:  true,
             blend_mode: BlendMode::Overwrite,
@@ -331,6 +338,19 @@ impl App {
                 self.render_cell(c, r);
             }
         }
+    }
+
+    // ── Demo ─────────────────────────────────────────────────────────────────
+
+    /// Wipe the intro demo content and re-render the now-blank canvas.
+    /// Called at the top of every mousedown/touchstart handler, before any
+    /// undo snapshot is pushed, so demo content never appears in undo history.
+    /// Safe to call repeatedly — does nothing once demo_active is false.
+    pub(crate) fn clear_demo_if_active(&mut self) {
+        if !self.demo_active { return; }
+        for cell in self.grid.committed.iter_mut() { *cell = BLANK; }
+        self.render_all();
+        self.demo_active = false;
     }
 
     // ── Painting ─────────────────────────────────────────────────────────────

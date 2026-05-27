@@ -1,0 +1,22 @@
+# charpaint help text — English
+# Keys match data-help attributes in index.html.
+# Seed: tooltips as they existed at first authoring — expand freely.
+
+pencil: "Pencil — click and drag to draw with the current palette character."
+eraser: "Eraser — click and drag to erase cells back to blank."
+select: "Select — drag to mark a rectangular region. Selected content can be copied or cleared."
+fill: "Fill — click a cell to flood-fill all connected cells of the same character. Tap the button again to switch between 4-adjacent (respects enclosed outlines) and 8-adjacent (fills through diagonal corners) mode."
+text: "Text — click a cell to place the cursor, then type. Enter or switch tools to commit. Escape to cancel and restart the cursor at the session origin."
+line: "Line — drag to draw a straight line. Tap the button again to switch between character-stamp and ASCII art (─ │ \\ /) modes."
+rect: "Rectangle — drag to draw a hollow rectangle outline."
+rect-fill: "Filled Rectangle — drag to draw a solid filled rectangle."
+oval: "Oval — drag to draw an ellipse outline."
+oval-fill: "Filled Oval — drag to draw a solid filled ellipse."
+blend-mode: "Blend mode — cycles between Overwrite (replaces any cell) and Stamp (only paints into blank cells)."
+shift-constrain: "Axis constraint — locks drawing to a strict horizontal or vertical line. On desktop, holding Shift does the same thing."
+undo: "Undo — reverses the last action. Keyboard: Ctrl+Z."
+redo: "Redo — re-applies the last undone action. Keyboard: Shift+Ctrl+Z."
+copy: "Copy — copies the canvas as plain text to the clipboard. If a region is selected, copies only that region. Keyboard: Ctrl+C."
+clear: "Clear — erases the canvas. If a region is selected, erases only that region. Always undoable."
+theme: "Theme — switches between dark and light colour schemes."
+palette: "Character palette — click to select the character that drawing tools will place on the canvas."

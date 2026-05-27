@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0527:0409 -->
+<!-- build: 0527:0511 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -329,6 +329,78 @@
     .cell.cursor {
       animation: cursor-blink 1s step-end infinite;
     }
+
+    /* ── Help mode ────────────────────────────────────────────────────────────── */
+
+    /* ? button — position:relative + z-index:101 places it above the overlay     */
+    /* so it remains tappable while help mode is active, allowing the user to exit. */
+    #btn-help {
+      position: relative;
+      z-index: 101;
+      cursor: pointer;
+      padding: 2px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: bold;
+      line-height: 1.6;
+    }
+    #btn-help:hover { background: var(--border); }
+    #btn-help.active {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
+    }
+
+    /* Full-screen transparent overlay that intercepts all pointer events while    */
+    /* help mode is active. Rust briefly sets pointer-events:none before calling   */
+    /* elementFromPoint so the element underneath is discoverable, then restores.  */
+    /* rgba(0,0,0,0.001): nearly-invisible background ensures reliable hit-testing */
+    /* across browsers (fully transparent may skip events in some engines).        */
+    #help-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      cursor: help;
+      background: rgba(0, 0, 0, 0.001);
+      touch-action: none;
+    }
+
+    /* Floating balloon in the top-left of the canvas area.                      */
+    /* top/left approximate: menubar height (~36px) + gap, toolbar (56px) +      */
+    /* canvas padding (16px). Known approximation — revisit if layout changes.   */
+    #help-popup {
+      display: none;
+      position: fixed;
+      top: 44px;
+      left: 80px;
+      z-index: 102;
+      max-width: 300px;
+      background: var(--chrome);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 8px 12px;
+      user-select: none;
+    }
+    /* Key name — accented monospace chip above the help text */
+    #help-popup-key {
+      display: block;
+      font-family: monospace;
+      font-size: 10px;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent);
+      margin-bottom: 3px;
+    }
   </style>
 </head>
 <body>
@@ -336,11 +408,15 @@
   <!-- Menu bar — static labels; TBD: menus wired by Rust -->
   <div id="menubar">
     <span class="brand">charpaint</span>
+    <!-- Help mode toggle — leftmost after brand so it's reachable on small screens.
+         position:relative + z-index:101 (in CSS) keeps it above the help overlay. -->
+    <button id="btn-help" title="Help — tap any control to see what it does">?</button>
+    <span class="menu-sep"></span>
     <!-- Undo / redo — click handlers and Ctrl+Z/Shift+Ctrl+Z wired by Rust -->
-    <button id="btn-undo"  class="menu-action" title="Undo (Ctrl+Z)">↩</button>
-    <button id="btn-redo"  class="menu-action" title="Redo (Shift+Ctrl+Z)">↪</button>
-    <button id="btn-copy"  class="menu-action" title="Copy canvas to clipboard">⧉</button>
-    <button id="btn-clear" class="menu-action" title="Clear canvas (or selection)">⌧</button>
+    <button id="btn-undo"  class="menu-action" title="Undo (Ctrl+Z)"              data-help="undo">↩</button>
+    <button id="btn-redo"  class="menu-action" title="Redo (Shift+Ctrl+Z)"         data-help="redo">↪</button>
+    <button id="btn-copy"  class="menu-action" title="Copy canvas to clipboard"    data-help="copy">⧉</button>
+    <button id="btn-clear" class="menu-action" title="Clear canvas (or selection)" data-help="clear">⌧</button>
     <span class="menu-sep"></span>
     <span class="menu-item">File</span>
     <span class="menu-item">Edit</span>
@@ -348,7 +424,7 @@
     <span class="menu-item">Goodies</span>
     <span class="spacer"></span>
     <!-- Initial label "☀ Light" reflects current dark default; Rust toggles it -->
-    <button id="theme-toggle">☀ Light</button>
+    <button id="theme-toggle" data-help="theme">☀ Light</button>
   </div>
 
   <div id="main">
@@ -358,30 +434,30 @@
       <!-- Blend mode tile: shows current mode icon; mousedown+drag opens the fly-out (wired by Rust) -->
       <!-- #mode-dropdown is appended here by build_blend_mode_control() -->
       <div class="tool-row">
-        <div class="tool" id="mode-btn"     title="Blend mode: Overwrite">▊</div>
-        <div class="tool" id="shift-toggle" title="Constrain axis (Shift)">⇧</div>
+        <div class="tool" id="mode-btn"     title="Blend mode: Overwrite"  data-help="blend-mode">▊</div>
+        <div class="tool" id="shift-toggle" title="Constrain axis (Shift)" data-help="shift-constrain">⇧</div>
       </div>
       <div class="tool-sep"></div>
       <div class="tool-row">
-        <div class="tool active" data-tool="pencil"    title="Pencil">✎</div>
-        <div class="tool"        data-tool="select"    title="Select">⬚</div>
+        <div class="tool active" data-tool="pencil" title="Pencil" data-help="pencil">✎</div>
+        <div class="tool"        data-tool="select" title="Select" data-help="select">⬚</div>
       </div>
       <div class="tool-row">
-        <div class="tool" id="fill-tool-btn" data-tool="fill" title="Fill (4-adjacent) — tap again to cycle mode">✣</div>
-        <div class="tool" data-tool="text"   title="Text">A</div>
+        <div class="tool" id="fill-tool-btn" data-tool="fill" title="Fill (4-adjacent) — tap again to cycle mode" data-help="fill">✣</div>
+        <div class="tool" data-tool="text"   title="Text" data-help="text">A</div>
       </div>
       <div class="tool-sep"></div>
       <div class="tool-row">
-        <div class="tool" id="line-tool-btn" data-tool="line" title="Line — tap again to cycle mode">╲</div>
-        <div class="tool" data-tool="eraser"    title="Eraser">□</div>
+        <div class="tool" id="line-tool-btn" data-tool="line"   title="Line — tap again to cycle mode" data-help="line">╲</div>
+        <div class="tool"                    data-tool="eraser" title="Eraser"                         data-help="eraser">□</div>
       </div>
       <div class="tool-row">
-        <div class="tool" data-tool="rect"      title="Rectangle">▭</div>
-        <div class="tool" data-tool="rect-fill" title="Filled Rectangle">▬</div>
+        <div class="tool" data-tool="rect"      title="Rectangle"        data-help="rect">▭</div>
+        <div class="tool" data-tool="rect-fill" title="Filled Rectangle" data-help="rect-fill">▬</div>
       </div>
       <div class="tool-row">
-        <div class="tool" data-tool="oval"      title="Oval">○</div>
-        <div class="tool" data-tool="oval-fill" title="Filled Oval">●</div>
+        <div class="tool" data-tool="oval"      title="Oval"        data-help="oval">○</div>
+        <div class="tool" data-tool="oval-fill" title="Filled Oval" data-help="oval-fill">●</div>
       </div>
     </div>
 
@@ -395,7 +471,9 @@
   </div>
 
   <!-- Palette entries are created programmatically by Rust (build_palette) -->
-  <div id="palette"></div>
+  <!-- data-help="palette" on the container: find_help_key walks up to this when -->
+  <!-- hovering any palette item, showing one shared help entry for the whole strip. -->
+  <div id="palette" data-help="palette"></div>
 
   <!-- Hidden input: focused by Rust when the text tool is active to raise the
        mobile virtual keyboard. autocorrect/autocapitalize off to prevent the
@@ -403,6 +481,17 @@
   <input id="text-input" type="text"
          autocomplete="off" autocorrect="off"
          autocapitalize="off" spellcheck="false">
+
+  <!-- Help mode overlay: full-screen transparent layer that captures pointer events.
+       Rust briefly sets pointer-events:none before elementFromPoint so the element
+       underneath is discoverable. Shown/hidden by wire_help. -->
+  <div id="help-overlay"></div>
+
+  <!-- Help mode popup: fixed panel at the bottom showing help for the targeted element.
+       key span: accented label (e.g. "PENCIL"). text span: help body from the YAML. -->
+  <div id="help-popup">
+    <span id="help-popup-key"></span><span id="help-popup-text"></span>
+  </div>
 
   <script type="module">
     // Minimal loader — all application logic is in the Rust/WASM module.

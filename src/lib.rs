@@ -14,7 +14,10 @@ mod util;
 use util::bresenham;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help};
+
+// Help strings generated from locales/help.en.yaml by build.rs.
+include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -306,6 +309,11 @@ pub(crate) struct App {
     /// keyboard when a text session is active. Blurred on session end.
     text_input_el: HtmlInputElement,
 
+    /// True while the help-mode overlay is active.
+    /// When on, pointer events are captured by #help-overlay and routed to
+    /// the help popup instead of the canvas/toolbar.
+    pub(crate) help_mode: bool,
+
     // ── Touch / pinch-zoom state ─────────────────────────────────────────────
     grid_el:                          Element,      // #grid element — target for font-size changes
     pub(crate) font_size:             f64,          // current grid font size in px (default 16)
@@ -344,6 +352,7 @@ impl App {
             pinch_start_dist:      0.0,
             pinch_start_font_size: 16.0,
             pan_last_mid:          (0.0, 0.0),
+            help_mode:             false,
         }
     }
 
@@ -886,6 +895,15 @@ impl App {
             .unwrap();
     }
 
+    // ── Help mode ────────────────────────────────────────────────────────────
+
+    /// Toggle help mode on/off. Returns the new state so the caller can
+    /// update button and overlay visibility without a second borrow.
+    pub(crate) fn toggle_help_mode(&mut self) -> bool {
+        self.help_mode = !self.help_mode;
+        self.help_mode
+    }
+
     // ── Text entry ───────────────────────────────────────────────────────────
 
     /// Internal: position the cursor at (col, row) and push an undo snapshot.
@@ -1386,4 +1404,5 @@ pub fn start() {
     wire_touch(&document, &app);
     wire_shift_toggle(&document, &app);
     wire_text_input(&document, &app);
+    wire_help(&document, &app);
 }

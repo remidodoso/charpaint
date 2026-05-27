@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, Event, KeyboardEvent, MouseEvent, NodeList, TouchEvent, Window};
+use web_sys::{Document, Element, Event, KeyboardEvent, MouseEvent, NodeList, PointerEvent, TouchEvent, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
@@ -973,4 +973,128 @@ pub fn wire_text_input(document: &Document, app: &Rc<RefCell<App>>) {
     });
     el.add_event_listener_with_callback("input", cb.as_ref().unchecked_ref()).unwrap();
     cb.forget();
+}
+
+/// Wire the `#btn-help` toggle and `#help-overlay` pointer handlers.
+///
+/// Clicking `?` toggles help mode on/off (updating `app.help_mode`, the button's
+/// active class, and overlay/popup visibility). The `?` button sits above the
+/// overlay via CSS z-index so it remains clickable while help is active.
+///
+/// While help mode is on, the overlay captures:
+///   pointermove — hover-to-explore on desktop: moves the help popup continuously.
+///   pointerdown — tap-to-explore on mobile (and desktop click): same lookup.
+///
+/// For each event, `show_help_for_point` briefly sets `pointer-events: none` on
+/// the overlay, calls `elementFromPoint` to discover the element underneath, then
+/// restores the overlay. It walks up the DOM to find the nearest `data-help`
+/// attribute and displays the matching YAML string in `#help-popup`.
+pub fn wire_help(document: &Document, app: &Rc<RefCell<App>>) {
+    // ── ? button: toggle help mode ────────────────────────────────────────────
+    let btn = match document.get_element_by_id("btn-help") {
+        Some(el) => el,
+        None => return,
+    };
+
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let help_on = app.borrow_mut().toggle_help_mode();
+            if help_on {
+                btn_clone.class_list().add_1("active").unwrap();
+            } else {
+                btn_clone.class_list().remove_1("active").unwrap();
+            }
+            set_help_visibility(&doc_clone, help_on);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // ── Overlay: discover element under pointer, show help ────────────────────
+    let overlay = match document.get_element_by_id("help-overlay") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // pointermove — continuous hover discovery on desktop.
+    {
+        let doc_clone     = document.clone();
+        let overlay_clone = overlay.clone();
+        let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+            show_help_for_point(e.client_x() as f64, e.client_y() as f64, &doc_clone, &overlay_clone);
+        });
+        overlay.add_event_listener_with_callback("pointermove", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // pointerdown — tap discovery for mobile (also fires on desktop click).
+    {
+        let doc_clone     = document.clone();
+        let overlay_clone = overlay.clone();
+        let cb = Closure::<dyn FnMut(PointerEvent)>::new(move |e: PointerEvent| {
+            e.prevent_default(); // prevent synthetic mouse/scroll events on mobile
+            show_help_for_point(e.client_x() as f64, e.client_y() as f64, &doc_clone, &overlay_clone);
+        });
+        overlay.add_event_listener_with_callback("pointerdown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Show or hide the help overlay and popup together.
+/// Called when help mode is toggled; on hide, clears the popup content.
+fn set_help_visibility(document: &Document, visible: bool) {
+    if let Some(overlay) = document.get_element_by_id("help-overlay") {
+        let _ = overlay.set_attribute("style", if visible { "display: block" } else { "display: none" });
+    }
+    if let Some(popup) = document.get_element_by_id("help-popup") {
+        let _ = popup.set_attribute("style", if visible { "display: block" } else { "display: none" });
+        if visible {
+            // Seed with the "move over something" prompt so the popup isn't blank.
+            if let Some(el) = document.get_element_by_id("help-popup-key") {
+                el.set_text_content(Some("—"));
+            }
+            if let Some(el) = document.get_element_by_id("help-popup-text") {
+                el.set_text_content(Some("Hover over or tap any control to see what it does."));
+            }
+        }
+    }
+}
+
+/// Briefly remove the overlay from hit-testing, discover the element at (x, y),
+/// restore the overlay, then look up its `data-help` key and update the popup.
+fn show_help_for_point(x: f64, y: f64, document: &Document, overlay: &Element) {
+    // Step aside so elementFromPoint sees through us.
+    let _ = overlay.set_attribute("style", "display: block; pointer-events: none");
+    let found = document.element_from_point(x as f32, y as f32);
+    let _ = overlay.set_attribute("style", "display: block; pointer-events: auto");
+
+    let key_el  = document.get_element_by_id("help-popup-key");
+    let text_el = document.get_element_by_id("help-popup-text");
+
+    match found.and_then(|el| find_help_key(&el)) {
+        Some(key) => {
+            let text = crate::help(&key).unwrap_or("");
+            if let Some(el) = key_el  { el.set_text_content(Some(&key)); }
+            if let Some(el) = text_el { el.set_text_content(Some(text)); }
+        }
+        None => {
+            if let Some(el) = key_el  { el.set_text_content(Some("—")); }
+            if let Some(el) = text_el { el.set_text_content(Some("Hover over or tap any control to see what it does.")); }
+        }
+    }
+}
+
+/// Walk up the DOM from `el`, returning the first `data-help` attribute value found.
+fn find_help_key(el: &Element) -> Option<String> {
+    let mut current = Some(el.clone());
+    while let Some(e) = current {
+        if let Some(key) = e.get_attribute("data-help") {
+            return Some(key);
+        }
+        current = e.parent_element();
+    }
+    None
 }

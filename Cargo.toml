@@ -42,8 +42,12 @@ features = [
   "Touch",         # individual touch point within a TouchEvent
   "TouchList",     # collection of Touch objects (e.touches(), etc.)
   "DomRect",       # bounding rect returned by getBoundingClientRect — used for pinch-zoom scroll correction
+  "PointerEvent",  # unified pointer events used by the help-mode overlay (desktop hover + mobile tap)
 ]
 
 # chrono runs only on the host at compile time (build.rs) — never touches the WASM output.
 [build-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
+# serde + serde_yaml: parse locales/help.en.yaml at compile time to generate help_strings.rs.
+serde      = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

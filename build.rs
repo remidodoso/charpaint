@@ -33,6 +33,41 @@ fn main() {
         let _ = std::fs::write(path, updated);
     }
 
+    // ── Help strings codegen ──────────────────────────────────────────────────
+    // Read locales/help.en.yaml and emit a `help()` function into OUT_DIR.
+    // The generated file is included by src/lib.rs via include!().
+    // No rerun-if-changed → build script always runs, so strings stay in sync.
+    {
+        use std::collections::BTreeMap;
+
+        let yaml_src = std::fs::read_to_string("locales/help.en.yaml")
+            .unwrap_or_default();
+        let map: BTreeMap<String, String> = serde_yaml::from_str(&yaml_src)
+            .unwrap_or_default();
+
+        let mut arms = String::new();
+        for (key, val) in &map {
+            // Escape backslashes and double-quotes so the value is valid in a Rust string literal.
+            let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
+            arms.push_str(&format!("        \"{key}\" => Some(\"{escaped}\"),\n"));
+        }
+
+        let code = format!(
+            "/// Look up a help string by its data-help key.\n\
+             /// Returns None for unknown keys; callers may show a fallback message.\n\
+             pub(crate) fn help(key: &str) -> Option<&'static str> {{\n\
+             \x20\x20\x20\x20match key {{\n\
+             {arms}\
+             \x20\x20\x20\x20\x20\x20\x20\x20_ => None,\n\
+             \x20\x20\x20\x20}}\n\
+             }}\n"
+        );
+
+        let out_dir  = std::env::var("OUT_DIR").unwrap();
+        let out_path = std::path::Path::new(&out_dir).join("help_strings.rs");
+        std::fs::write(&out_path, code).unwrap();
+    }
+
     // No rerun-if-changed directive → build script runs on every `cargo build`,
-    // so the timestamp is always fresh.
+    // so the timestamp is always fresh and the YAML is always re-read.
 }

@@ -4,12 +4,31 @@
 //! canvas API and return processed Rust data structures. No web-sys types appear
 //! in this module; it is independently testable.
 
-/// Processing resolution bounds (height in pixels). The source image is scaled
-/// so its height falls in [PROCESSED_MIN_HEIGHT, PROCESSED_MAX_HEIGHT] with
-/// width proportional. Width is not independently clamped — extreme panoramas
-/// and vertical strips are known edge cases deferred to the placement/rescale UI.
-pub(crate) const PROCESSED_MIN_HEIGHT: u32 = 512;
-pub(crate) const PROCESSED_MAX_HEIGHT: u32 = 2048;
+/// Fixed processing height in pixels. Every dropped image is scaled to exactly
+/// this height (width proportional) before the AA pipeline runs. 1024px gives
+/// 3×3 Sobel edge features of 1–2px width — approximately one font-point stroke
+/// width at notional 12pt scale. Balances detail vs. PNG-encoding performance.
+pub(crate) const PROCESSING_HEIGHT: u32 = 1024;
+
+/// Assumed character cell height in font points for the AA character-matching step.
+/// Not used for edge detection, which runs at full PROCESSING_HEIGHT resolution.
+pub(crate) const NOTIONAL_CELL_PX: u32 = 12;
+
+/// Sprite catalog dimensions. Each character is rendered to a bitmap of this size
+/// for catalog storage and image-patch comparison. SPRITE_H = NOTIONAL_CELL_PX;
+/// SPRITE_W ≈ 0.6× height — standard monospace aspect ratio approximation.
+/// Both must match the canvas rendering in build_sprite_catalog (lib.rs).
+pub(crate) const SPRITE_W: u32 = 7;
+pub(crate) const SPRITE_H: u32 = 12;
+
+/// Top fraction of edge pixels (by magnitude) that maps to 255 after clipping.
+/// Lowering this makes fewer pixels qualify as "real edges" — sharper but potentially
+/// missing faint edges. Raising it admits more gradual transitions.
+const EDGE_CLIP_PERCENT: f32 = 5.0;
+
+/// Gamma exponent applied after the percentile stretch. Values > 1 crush midtones
+/// toward black, pushing the result toward binary. 2.5 is a good starting point.
+const EDGE_GAMMA: f32 = 2.5;
 
 /// Fraction of pixels clipped at each end of the luminance histogram before
 /// the linear stretch. 1 % is gentle — a small number of blown-out highlights
@@ -96,5 +115,119 @@ pub fn stretch_luminance(luma: &mut [u8]) {
             .max(0.0)
             .min(255.0);
         *v = stretched.round() as u8;
+    }
+}
+
+/// Find the catalog sprite (0 = ASCII 32 = space, 94 = ASCII 126 = '~') whose
+/// grayscale bitmap most closely matches `patch` by minimum sum-of-squared differences.
+/// Both `patch` and every sprite must be SPRITE_W × SPRITE_H bytes.
+/// Returns the index of the best match; caller maps it back to a char via `idx + 32`.
+pub fn best_sprite_match(patch: &[u8], sprites: &[Vec<u8>]) -> usize {
+    let mut best_idx   = 0;
+    let mut best_score = f32::MAX;
+    for (i, sprite) in sprites.iter().enumerate() {
+        let score: f32 = patch.iter().zip(sprite.iter())
+            .map(|(&a, &b)| { let d = a as f32 - b as f32; d * d })
+            .sum();
+        if score < best_score {
+            best_score = score;
+            best_idx   = i;
+        }
+    }
+    best_idx
+}
+
+/// Compute a Sobel edge-magnitude map from a luminance slice.
+///
+/// Runs a 3×3 Sobel filter directly on the full-resolution luma image.
+/// At PROCESSING_HEIGHT = 1024px, edges are 1–2px wide — approximately one
+/// font-point stroke width at notional 12pt scale.
+///
+/// Boundary pixels use nearest-edge clamping so the output is the same size
+/// as the input (no border shrinkage).
+///
+/// Returns a flat byte slice (length = width × height) of edge magnitudes,
+/// normalised to [0, 255], where 0 = no edge and 255 = strongest edge.
+pub fn sobel_edges(luma: &[u8], width: u32, height: u32) -> Vec<u8> {
+    if luma.is_empty() || width == 0 || height == 0 {
+        return vec![0u8; luma.len()];
+    }
+
+    let w = width  as usize;
+    let h = height as usize;
+
+    // Gx = [[-1,0,1],[-2,0,2],[-1,0,1]]
+    // Gy = [[-1,-2,-1],[0,0,0],[1,2,1]]
+    let mut mag = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let s = |oy: i32, ox: i32| -> f32 {
+                let nx = ((x as i32 + ox).max(0) as usize).min(w - 1);
+                let ny = ((y as i32 + oy).max(0) as usize).min(h - 1);
+                luma[ny * w + nx] as f32
+            };
+            let gx = -s(-1,-1) + s(-1,1) - 2.0*s(0,-1) + 2.0*s(0,1) - s(1,-1) + s(1,1);
+            let gy = -s(-1,-1) - 2.0*s(-1,0) - s(-1,1) + s(1,-1) + 2.0*s(1,0) + s(1,1);
+            mag[y * w + x] = (gx * gx + gy * gy).sqrt();
+        }
+    }
+
+    // Normalise to [0, 255].
+    let max_val = mag.iter().cloned().fold(0.0f32, f32::max);
+    let mut result = vec![0u8; w * h];
+    if max_val > 0.0 {
+        for (i, &v) in mag.iter().enumerate() {
+            result[i] = (v / max_val * 255.0).min(255.0).round() as u8;
+        }
+    }
+    result
+}
+
+/// Post-process a Sobel edge map toward a near-binary appearance.
+///
+/// Two steps:
+///   1. Percentile clip — the top EDGE_CLIP_PERCENT of pixels map to 255;
+///      everything below is linearly stretched. This resets the "real edge" floor
+///      so the noise floor becomes relatively darker.
+///   2. Gamma curve — raise each normalised value to the EDGE_GAMMA power.
+///      Exponents > 1 crush midtones toward black while leaving bright edges intact.
+///
+/// The combination produces an output that reads as near-binary: background ~0,
+/// edges ~255, with only a short transition band between them.
+pub fn enhance_edges(edges: &mut [u8]) {
+    if edges.is_empty() { return; }
+
+    // Build a 256-bin histogram to locate the clip threshold.
+    let mut hist = [0u64; 256];
+    for &v in edges.iter() {
+        hist[v as usize] += 1;
+    }
+
+    let total      = edges.len() as f32;
+    let clip_count = (EDGE_CLIP_PERCENT / 100.0 * total).round() as u64;
+
+    // Find the value where the top EDGE_CLIP_PERCENT of pixels start (high cut).
+    let mut hi: u8 = 255;
+    {
+        let mut cum = 0u64;
+        for (i, &count) in hist.iter().enumerate().rev() {
+            cum += count;
+            if cum > clip_count {
+                hi = i as u8;
+                break;
+            }
+        }
+    }
+
+    // Degenerate case: no edges detected (blank image or uniform field).
+    if hi == 0 { return; }
+
+    let scale = 255.0 / hi as f32;
+
+    for v in edges.iter_mut() {
+        // Step 1: linear stretch so the clip point maps to 255, clamp above.
+        let stretched = (*v as f32 * scale).min(255.0);
+        // Step 2: gamma — (v/255)^gamma * 255 — crushes midtones toward black.
+        *v = ((stretched / 255.0).powf(EDGE_GAMMA) * 255.0).round() as u8;
     }
 }

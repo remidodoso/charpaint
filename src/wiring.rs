@@ -1205,3 +1205,133 @@ pub fn wire_drag_drop(document: &Document, app: &Rc<RefCell<App>>) {
         cb.forget();
     }
 }
+
+/// Wire the `#outline-mode-btn` background-outline mode button.
+///
+/// Tap-to-cycle: each tap advances through three background render modes:
+///   Original (▒) → White on black (┼) → Black on white (╬) → Original
+///
+/// After cycling the mode the background is immediately re-rendered from the
+/// stored luma data by calling `rebuild_background`. No-ops when no image has
+/// been dropped yet (rebuild_background returns early if bg_luma is None).
+///
+/// Same three-listener pattern (touchstart/touchend/mousedown) as wire_blend_mode.
+pub fn wire_outline_mode(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("outline-mode-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse event chain from this button's tap.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — cycle mode for touch devices.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            outline_mode_tap(&app, &btn_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — cycle mode for desktop mouse, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            outline_mode_tap(&app, &btn_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Wire the `#aa-mode-btn` AA brush mode toggle in the palette strip.
+///
+/// Tap-to-toggle: turns aa_mode on or off, applying the `.active` class.
+/// The button starts disabled (no image loaded); `process_bg_image` removes
+/// the `.disabled` class after a successful drop. While disabled, clicks are
+/// blocked by CSS `pointer-events: none` so this handler never fires then.
+///
+/// Same three-listener pattern as other mode buttons.
+pub fn wire_aa_mode(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("aa-mode-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse chain.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — toggle for touch.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            aa_mode_tap(&app, &btn_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — toggle for desktop, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            aa_mode_tap(&app, &btn_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+fn aa_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
+    let mut a = app.borrow_mut();
+    a.aa_mode = !a.aa_mode;
+    if a.aa_mode {
+        btn.class_list().add_1("active").unwrap();
+    } else {
+        btn.class_list().remove_1("active").unwrap();
+    }
+}
+
+/// Shared action for touch and mouse outline-mode taps.
+/// Cycles bg_outline_mode, updates the button, and re-renders the background.
+fn outline_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
+    let mode = {
+        let mut a = app.borrow_mut();
+        a.bg_outline_mode = a.bg_outline_mode.cycle();
+        a.bg_outline_mode
+    };
+    btn.set_text_content(Some(mode.icon()));
+    btn.set_attribute("title", &format!("Background: {} — tap to cycle", mode.name())).unwrap();
+    // Re-render from stored luma data; no-ops if no image has been dropped yet.
+    app.borrow_mut().rebuild_background();
+}

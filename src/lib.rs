@@ -16,7 +16,7 @@ use util::bresenham;
 mod asciiart;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode};
 
 // Help strings generated from locales/help.en.yaml by build.rs.
 include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
@@ -131,6 +131,45 @@ impl FillMode {
         match self {
             FillMode::Flood4 => FillMode::Flood8,
             FillMode::Flood8 => FillMode::Flood4,
+        }
+    }
+}
+
+// ── BgOutlineMode ─────────────────────────────────────────────────────────────
+
+/// How the background image is rendered: as the processed luminance, or as an
+/// edge map derived from it. The edge scale is set by NOTIONAL_CELL_PX so edges
+/// correspond to character-cell-sized features regardless of the image resolution.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum BgOutlineMode {
+    Original,      // processed luma — continuous-tone grayscale background
+    WhiteOnBlack,  // Sobel edge map — bright edges on dark field
+    BlackOnWhite,  // Sobel edge map inverted — dark edges on light field
+}
+
+impl BgOutlineMode {
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            BgOutlineMode::Original     => "▒",
+            BgOutlineMode::WhiteOnBlack => "┼",
+            BgOutlineMode::BlackOnWhite => "╬",
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            BgOutlineMode::Original     => "Original",
+            BgOutlineMode::WhiteOnBlack => "White on black",
+            BgOutlineMode::BlackOnWhite => "Black on white",
+        }
+    }
+
+    /// Cycle: Original → WhiteOnBlack → BlackOnWhite → Original.
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            BgOutlineMode::Original     => BgOutlineMode::WhiteOnBlack,
+            BgOutlineMode::WhiteOnBlack => BgOutlineMode::BlackOnWhite,
+            BgOutlineMode::BlackOnWhite => BgOutlineMode::Original,
         }
     }
 }
@@ -326,6 +365,36 @@ pub(crate) struct App {
     pub(crate) bg_luma_width:  u32,
     pub(crate) bg_luma_height: u32,
 
+    /// Sobel + enhance edge map derived from bg_luma at the same dimensions.
+    /// Used by compute_best_char: edge features (bright = present) are matched
+    /// against inverted sprites (white strokes on black) via SSD, so character
+    /// stroke directions align with edge directions in the image.
+    pub(crate) bg_edges: Option<Vec<u8>>,
+
+    /// Cached visible rectangle of the processed image behind the grid, in
+    /// processed-image pixel coordinates: (x0, y0, width, height).
+    /// Mirrors CSS background-size/position: center so cell-to-image mapping
+    /// matches what is actually displayed. Recomputed by refresh_visible_rect()
+    /// whenever the grid layout or background image changes. Avoids calling
+    /// client_width/height (which forces a browser reflow) per painted cell.
+    bg_visible_rect: (f64, f64, f64, f64),
+
+    /// How the background image is rendered: original luma, white-on-black edges,
+    /// or black-on-white edges. Cycled by #outline-mode-btn; persists across drops.
+    pub(crate) bg_outline_mode: BgOutlineMode,
+
+    /// True when the AA brush mode is active. When on, each cell stamped by any
+    /// drawing tool receives the catalog character that best matches the image
+    /// region under it, rather than the fixed brush_char from the palette.
+    pub(crate) aa_mode: bool,
+    /// Reference to #aa-mode-btn for enable/disable when the background changes.
+    /// Stored here so process_bg_image and future clear-image code can update it.
+    aa_btn_el: Element,
+    /// Pre-rendered grayscale bitmaps for printable ASCII chars 32–126 (95 entries).
+    /// Indexed as (char_code − 32). Each entry is SPRITE_W × SPRITE_H bytes.
+    /// Built once at startup; empty vec means catalog unavailable (AA mode no-ops).
+    pub(crate) sprite_catalog: Vec<Vec<u8>>,
+
     /// True while the help-mode overlay is active.
     /// When on, pointer events are captured by #help-overlay and routed to
     /// the help popup instead of the canvas/toolbar.
@@ -341,7 +410,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -374,6 +443,12 @@ impl App {
             bg_luma:               None,
             bg_luma_width:         0,
             bg_luma_height:        0,
+            bg_edges:              None,
+            bg_visible_rect:       (0.0, 0.0, 0.0, 0.0),
+            bg_outline_mode:       BgOutlineMode::Original,
+            aa_mode:               false,
+            aa_btn_el,
+            sprite_catalog:        Vec::new(),
             help_mode:             false,
         }
     }
@@ -488,7 +563,6 @@ impl App {
     pub(crate) fn paint_stroke_to(&mut self, col: usize, row: usize, shift_held: bool) {
         match self.tool {
             Tool::Pencil | Tool::Eraser => {
-                let ch = if self.tool == Tool::Pencil { self.brush_char } else { BLANK };
                 let (col, row) = self.resolve_target(col, row, shift_held || self.shift_locked);
                 let cells = match self.last_painted_cell {
                     Some((pc, pr)) => bresenham(pc, pr, col, row),
@@ -502,6 +576,8 @@ impl App {
                     {
                         continue;
                     }
+                    // Compute per-cell: eraser always BLANK; AA mode looks up image.
+                    let ch = self.stamp_char(c, r);
                     self.grid.set_preview(c, r, Some(ch));
                     self.render_cell(c, r);
                 }
@@ -521,22 +597,27 @@ impl App {
                     let overall_dc = (col as i32) - (sc as i32);
                     let overall_dr = (row as i32) - (sr as i32);
                     for (i, &(c, r)) in cells.iter().enumerate() {
-                        let ch = match self.line_mode {
-                            LineMode::Character => self.brush_char,
-                            LineMode::Art => {
-                                if i == 0 {
-                                    // Use the step to the next cell so the start character
-                                    // matches the local direction, not the overall slope.
-                                    // Falls back to overall direction for single-cell lines.
-                                    if cells.len() > 1 {
-                                        let (nc, nr) = cells[1];
-                                        art_char((nc as i32) - (c as i32), (nr as i32) - (r as i32))
+                        // AA mode overrides line mode — use image-matched char per cell.
+                        let ch = if self.aa_mode && self.bg_edges.is_some() && !self.sprite_catalog.is_empty() {
+                            self.compute_best_char(c, r)
+                        } else {
+                            match self.line_mode {
+                                LineMode::Character => self.brush_char,
+                                LineMode::Art => {
+                                    if i == 0 {
+                                        // Use the step to the next cell so the start character
+                                        // matches the local direction, not the overall slope.
+                                        // Falls back to overall direction for single-cell lines.
+                                        if cells.len() > 1 {
+                                            let (nc, nr) = cells[1];
+                                            art_char((nc as i32) - (c as i32), (nr as i32) - (r as i32))
+                                        } else {
+                                            art_char(overall_dc, overall_dr)
+                                        }
                                     } else {
-                                        art_char(overall_dc, overall_dr)
+                                        let (pc, pr) = cells[i - 1];
+                                        art_char((c as i32) - (pc as i32), (r as i32) - (pr as i32))
                                     }
-                                } else {
-                                    let (pc, pr) = cells[i - 1];
-                                    art_char((c as i32) - (pc as i32), (r as i32) - (pr as i32))
                                 }
                             }
                         };
@@ -598,7 +679,8 @@ impl App {
                         {
                             continue;
                         }
-                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        let ch = self.stamp_char(c, r);
+                        self.grid.set_preview(c, r, Some(ch));
                         self.render_cell(c, r);
                     }
                 }
@@ -634,7 +716,8 @@ impl App {
                             {
                                 continue;
                             }
-                            self.grid.set_preview(c, r, Some(self.brush_char));
+                            let ch = self.stamp_char(c, r);
+                            self.grid.set_preview(c, r, Some(ch));
                             self.render_cell(c, r);
                         }
                     }
@@ -669,7 +752,8 @@ impl App {
                         {
                             continue;
                         }
-                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        let ch = self.stamp_char(c, r);
+                        self.grid.set_preview(c, r, Some(ch));
                         self.render_cell(c, r);
                     }
                 }
@@ -700,7 +784,8 @@ impl App {
                         {
                             continue;
                         }
-                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        let ch = self.stamp_char(c, r);
+                        self.grid.set_preview(c, r, Some(ch));
                         self.render_cell(c, r);
                     }
                 }
@@ -724,7 +809,8 @@ impl App {
                 let target_char = self.grid.committed[Grid::idx(col, row)];
                 // No-op when the cell already contains the brush character; filling
                 // would either do nothing or loop forever.
-                if target_char != self.brush_char {
+                // In AA mode always fill — there's no single reference char to compare.
+                if self.aa_mode || target_char != self.brush_char {
                     let diagonals = self.fill_mode == FillMode::Flood8;
                     for (c, r) in flood_fill_cells(col, row, target_char, &self.grid.committed, diagonals) {
                         if self.blend_mode == BlendMode::Stamp
@@ -732,7 +818,8 @@ impl App {
                         {
                             continue;
                         }
-                        self.grid.set_preview(c, r, Some(self.brush_char));
+                        let ch = self.stamp_char(c, r);
+                        self.grid.set_preview(c, r, Some(ch));
                         self.render_cell(c, r);
                     }
                 }
@@ -919,11 +1006,36 @@ impl App {
         let _ = self.grid_el.set_attribute("style", &style);
     }
 
+    /// Recompute the visible rectangle of the processed image behind the grid.
+    /// Reads client_width/height from the DOM once; call whenever the grid layout
+    /// or background image changes rather than inside per-cell painting loops.
+    fn refresh_visible_rect(&mut self) {
+        let proc_w = self.bg_luma_width  as f64;
+        let proc_h = self.bg_luma_height as f64;
+        if proc_w == 0.0 || proc_h == 0.0 {
+            self.bg_visible_rect = (0.0, 0.0, proc_w, proc_h);
+            return;
+        }
+        let grid_w = self.grid_el.client_width()  as f64;
+        let grid_h = self.grid_el.client_height() as f64;
+        if grid_w == 0.0 || grid_h == 0.0 {
+            self.bg_visible_rect = (0.0, 0.0, proc_w, proc_h);
+            return;
+        }
+        let s   = (grid_w / proc_w).max(grid_h / proc_h).min(2.0);
+        let vx0 = ((proc_w - grid_w / s) / 2.0).max(0.0);
+        let vy0 = ((proc_h - grid_h / s) / 2.0).max(0.0);
+        let vw  = (grid_w / s).min(proc_w);
+        let vh  = (grid_h / s).min(proc_h);
+        self.bg_visible_rect = (vx0, vy0, vw, vh);
+    }
+
     /// Set the grid font size, clamped to 8–48 px, and apply it to the DOM.
     /// Called on every pinch-zoom touchmove frame.
     pub(crate) fn set_font_size(&mut self, size: f64) {
         self.font_size = size.max(8.0).min(48.0);
         self.sync_grid_style();
+        self.refresh_visible_rect(); // grid pixel dimensions change with font size
     }
 
     /// Apply a background image to #grid. The image is shown at 50% opacity by
@@ -979,13 +1091,10 @@ impl App {
             Some(c) => c,
             None    => return,
         };
-        // Scale to processing resolution: height clamped to [MIN, MAX], width proportional.
-        let target_h = (nh as f64)
-            .max(asciiart::PROCESSED_MIN_HEIGHT as f64)
-            .min(asciiart::PROCESSED_MAX_HEIGHT as f64);
-        let scale  = target_h / nh as f64;
+        // Scale to fixed processing height; width proportional to preserve aspect ratio.
+        let scale  = asciiart::PROCESSING_HEIGHT as f64 / nh as f64;
         let proc_w = (nw as f64 * scale).round() as u32;
-        let proc_h = target_h as u32;
+        let proc_h = asciiart::PROCESSING_HEIGHT;
 
         canvas.set_width(proc_w);
         canvas.set_height(proc_h);
@@ -1019,24 +1128,100 @@ impl App {
         let mut luma = asciiart::to_luminance(&rgba);
         asciiart::stretch_luminance(&mut luma);
 
-        // Build grayscale RGBA: R=G=B=L, A=255.
-        let mut gray_rgba = vec![0u8; luma.len() * 4];
-        for (i, &l) in luma.iter().enumerate() {
-            gray_rgba[i * 4    ] = l;
-            gray_rgba[i * 4 + 1] = l;
-            gray_rgba[i * 4 + 2] = l;
-            gray_rgba[i * 4 + 3] = 255;
-        }
+        // Pre-compute the edge map for AA sprite matching while luma is still owned.
+        // Edges are stored separately from luma so rebuild_background can use either.
+        let mut edges = asciiart::sobel_edges(&luma, proc_w, proc_h);
+        asciiart::enhance_edges(&mut edges);
 
-        // Write grayscale pixels back to the canvas and export as a data URL.
-        // Clamped<&[u8]> is the type this web-sys version expects — no unsafe needed.
-        let new_image_data = match web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+        self.bg_luma        = Some(luma);
+        self.bg_luma_width  = proc_w;
+        self.bg_luma_height = proc_h;
+        self.bg_edges       = Some(edges);
+        self.rebuild_background();
+        // Unlock the AA brush — catalog is built and image is now available.
+        self.enable_aa_btn();
+    }
+
+    /// Re-render the stored luma data as a background image according to the current
+    /// bg_outline_mode. Called after a new image is processed and when the mode cycles.
+    /// No-ops gracefully when no image has been dropped yet.
+    pub(crate) fn rebuild_background(&mut self) {
+        // Compute pixel data while bg_luma is immutably borrowed; release borrow
+        // before calling apply_bg_image which needs a mutable self.
+        let (gray_rgba, proc_w, proc_h) = {
+            let luma = match self.bg_luma.as_ref() {
+                Some(l) => l,
+                None    => return,
+            };
+            let w = self.bg_luma_width;
+            let h = self.bg_luma_height;
+            if w == 0 || h == 0 { return; }
+
+            let pixels = match self.bg_outline_mode {
+                BgOutlineMode::Original => {
+                    // Straight grayscale: R=G=B=L, A=255.
+                    let mut v = vec![0u8; luma.len() * 4];
+                    for (i, &l) in luma.iter().enumerate() {
+                        v[i*4] = l; v[i*4+1] = l; v[i*4+2] = l; v[i*4+3] = 255;
+                    }
+                    v
+                }
+                BgOutlineMode::WhiteOnBlack => {
+                    // Edge magnitude map — bright where edges are, dark elsewhere.
+                    let mut edges = asciiart::sobel_edges(luma, w, h);
+                    asciiart::enhance_edges(&mut edges);
+                    let mut v = vec![0u8; edges.len() * 4];
+                    for (i, &e) in edges.iter().enumerate() {
+                        v[i*4] = e; v[i*4+1] = e; v[i*4+2] = e; v[i*4+3] = 255;
+                    }
+                    v
+                }
+                BgOutlineMode::BlackOnWhite => {
+                    // Inverted edge map — enhance first, then invert so edges are dark on white.
+                    let mut edges = asciiart::sobel_edges(luma, w, h);
+                    asciiart::enhance_edges(&mut edges);
+                    let mut v = vec![0u8; edges.len() * 4];
+                    for (i, &e) in edges.iter().enumerate() {
+                        let inv = 255u8.saturating_sub(e);
+                        v[i*4] = inv; v[i*4+1] = inv; v[i*4+2] = inv; v[i*4+3] = 255;
+                    }
+                    v
+                }
+            };
+            (pixels, w, h)
+        };
+
+        let document = match web_sys::window().and_then(|w| w.document()) {
+            Some(d) => d,
+            None    => return,
+        };
+
+        // Off-screen canvas — write processed pixels and export as a data URL.
+        let canvas = match document
+            .create_element("canvas").ok()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+        {
+            Some(c) => c,
+            None    => return,
+        };
+        canvas.set_width(proc_w);
+        canvas.set_height(proc_h);
+
+        let ctx = match canvas
+            .get_context("2d").ok().flatten()
+            .and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+        {
+            Some(c) => c,
+            None    => return,
+        };
+
+        let image_data = match web_sys::ImageData::new_with_u8_clamped_array_and_sh(
             wasm_bindgen::Clamped(&gray_rgba[..]), proc_w, proc_h,
         ) {
             Ok(d)  => d,
             Err(_) => return,
         };
-        if ctx.put_image_data(&new_image_data, 0.0, 0.0).is_err() { return; }
+        if ctx.put_image_data(&image_data, 0.0, 0.0).is_err() { return; }
         let data_url = match canvas.to_data_url() {
             Ok(u)  => u,
             Err(_) => return,
@@ -1047,7 +1232,6 @@ impl App {
             .get_element_by_id("grid")
             .map(|g| (g.client_width() as f64, g.client_height() as f64))
             .unwrap_or((640.0, 384.0));
-
         let bg_size = {
             let cover_scale = (grid_w / proc_w as f64).max(grid_h / proc_h as f64);
             if cover_scale <= 2.0 {
@@ -1064,10 +1248,7 @@ impl App {
         };
 
         self.apply_bg_image(data_url, bg_size, overlay);
-
-        self.bg_luma        = Some(luma);
-        self.bg_luma_width  = proc_w;
-        self.bg_luma_height = proc_h;
+        self.refresh_visible_rect();
     }
 
     // ── Help mode ────────────────────────────────────────────────────────────
@@ -1077,6 +1258,88 @@ impl App {
     pub(crate) fn toggle_help_mode(&mut self) -> bool {
         self.help_mode = !self.help_mode;
         self.help_mode
+    }
+
+    // ── AA brush ─────────────────────────────────────────────────────────────
+
+    /// Enable the AA mode button. Called after a background image is loaded.
+    pub(crate) fn enable_aa_btn(&self) {
+        let _ = self.aa_btn_el.class_list().remove_1("disabled");
+    }
+
+    /// Disable the AA mode button and turn off AA mode.
+    /// Called when the background image is cleared so stale matching can't occur.
+    pub(crate) fn disable_aa_btn(&mut self) {
+        self.aa_mode = false;
+        let _ = self.aa_btn_el.class_list().remove_1("active");
+        let _ = self.aa_btn_el.class_list().add_1("disabled");
+    }
+
+    /// Return the character to stamp at (col, row) for the current drawing operation.
+    /// Eraser always returns BLANK. In AA mode with image + catalog available, queries
+    /// the catalog; falls back to brush_char if AA mode is off or no image is loaded.
+    fn stamp_char(&self, col: usize, row: usize) -> char {
+        if self.tool == Tool::Eraser { return BLANK; }
+        if self.aa_mode && self.bg_edges.is_some() && !self.sprite_catalog.is_empty() {
+            self.compute_best_char(col, row)
+        } else {
+            self.brush_char
+        }
+    }
+
+    /// Sample the bg_edges region under cell (col, row), compare against the sprite
+    /// catalog using sum-of-squared-differences, and return the best-matching char.
+    /// Falls back to brush_char if any data is unavailable.
+    fn compute_best_char(&self, col: usize, row: usize) -> char {
+        let edges = match self.bg_edges.as_ref() {
+            Some(e) => e,
+            None    => return self.brush_char,
+        };
+        if self.sprite_catalog.is_empty() { return self.brush_char; }
+
+        let proc_w = self.bg_luma_width  as f64;
+        let proc_h = self.bg_luma_height as f64;
+        let pw     = proc_w as usize;
+        let ph     = proc_h as usize;
+        let sw     = asciiart::SPRITE_W as usize;
+        let sh     = asciiart::SPRITE_H as usize;
+
+        // Use the cached visible rectangle — recomputed by refresh_visible_rect()
+        // when the image or grid layout changes, not on every cell painted.
+        let (vis_x0, vis_y0, vis_w, vis_h) = self.bg_visible_rect;
+
+        // Map this cell into the visible rectangle.
+        let cell_w = vis_w / COLS as f64;
+        let cell_h = vis_h / ROWS as f64;
+        let px0 = (vis_x0 + col       as f64 * cell_w).round() as usize;
+        let py0 = (vis_y0 + row       as f64 * cell_h).round() as usize;
+        let px1 = (vis_x0 + (col + 1) as f64 * cell_w).round() as usize;
+        let py1 = (vis_y0 + (row + 1) as f64 * cell_h).round() as usize;
+        let px1 = px1.min(pw).max(px0 + 1);
+        let py1 = py1.min(ph).max(py0 + 1);
+
+        // Box-average downsample the cell region to SPRITE_W × SPRITE_H.
+        let mut patch = vec![0u8; sw * sh];
+        for sy in 0..sh {
+            for sx in 0..sw {
+                let x0 = px0 + (sx       * (px1 - px0)) / sw;
+                let y0 = py0 + (sy       * (py1 - py0)) / sh;
+                let x1 = (px0 + ((sx + 1) * (px1 - px0)) / sw).max(x0 + 1).min(pw);
+                let y1 = (py0 + ((sy + 1) * (py1 - py0)) / sh).max(y0 + 1).min(ph);
+                let mut sum   = 0u32;
+                let mut count = 0u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        sum   += edges[y * pw + x] as u32;
+                        count += 1;
+                    }
+                }
+                patch[sy * sw + sx] = if count > 0 { (sum / count) as u8 } else { 0 };
+            }
+        }
+
+        let idx = asciiart::best_sprite_match(&patch, &self.sprite_catalog);
+        (idx as u8 + 32) as char
     }
 
     // ── Text entry ───────────────────────────────────────────────────────────
@@ -1212,6 +1475,73 @@ impl App {
         self.cell_els[Grid::idx(prev_col, row)].class_list().add_1("cursor").unwrap();
         self.text_cursor = Some((prev_col, row));
     }
+}
+
+// ── Sprite catalog ───────────────────────────────────────────────────────────
+
+/// Pre-render printable ASCII characters (codes 32–126) to grayscale bitmaps.
+///
+/// An off-screen canvas at SPRITE_W × SPRITE_H is reused for all 95 characters.
+/// Each character is rendered as black text on a white background so that:
+///   space (32) → all-white sprite ≈ bright image regions
+///   dense chars (@, #, …) → dark strokes on white ≈ dark image regions
+///
+/// The grayscale value used for comparison is the red channel (B&W canvas
+/// always has R = G = B). Returns 95 entries indexed as (char_code − 32),
+/// each SPRITE_W × SPRITE_H bytes. Returns an empty vec on any failure —
+/// stamp_char / compute_best_char degrade gracefully to brush_char.
+fn build_sprite_catalog(document: &Document) -> Vec<Vec<u8>> {
+    let canvas = match document
+        .create_element("canvas").ok()
+        .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+    {
+        Some(c) => c,
+        None    => return Vec::new(),
+    };
+    canvas.set_width(asciiart::SPRITE_W);
+    canvas.set_height(asciiart::SPRITE_H);
+
+    let ctx = match canvas
+        .get_context("2d").ok().flatten()
+        .and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+    {
+        Some(c) => c,
+        None    => return Vec::new(),
+    };
+
+    let sw = asciiart::SPRITE_W as f64;
+    let sh = asciiart::SPRITE_H as f64;
+
+    // top-left origin keeps characters within the sprite bounds.
+    ctx.set_font(&format!("{}px monospace", asciiart::SPRITE_H));
+    ctx.set_text_align("left");
+    ctx.set_text_baseline("top");
+
+    let mut catalog = Vec::with_capacity(95);
+
+    for code in 32u8..=126u8 {
+        // Black background, white strokes — matches edge map representation
+        // (feature present = bright, nothing = dark) so SSD favours characters
+        // whose stroke directions align with the edge features in the image patch.
+        ctx.set_fill_style_str("black");
+        ctx.fill_rect(0.0, 0.0, sw, sh);
+        ctx.set_fill_style_str("white");
+        let _ = ctx.fill_text(&(code as char).to_string(), 0.0, 0.0);
+
+        let pixels = match ctx.get_image_data(0.0, 0.0, sw, sh) {
+            Ok(d)  => d,
+            Err(_) => {
+                // On failure push a blank (all-white) sprite so indices stay aligned.
+                catalog.push(vec![255u8; (asciiart::SPRITE_W * asciiart::SPRITE_H) as usize]);
+                continue;
+            }
+        };
+        // RGBA → grayscale: canvas is B&W so R = G = B; take R channel.
+        let gray: Vec<u8> = pixels.data().0.chunks(4).map(|px| px[0]).collect();
+        catalog.push(gray);
+    }
+
+    catalog
 }
 
 // ── DOM construction ─────────────────────────────────────────────────────────
@@ -1555,7 +1885,15 @@ pub fn start() {
         .expect("#text-input must exist in HTML")
         .dyn_into::<HtmlInputElement>()
         .expect("#text-input must be an <input> element");
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el)));
+    let aa_btn_el = document
+        .get_element_by_id("aa-mode-btn")
+        .expect("#aa-mode-btn must exist in HTML");
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el)));
+
+    // Build the sprite catalog (95 printable ASCII chars → grayscale bitmaps).
+    // Done after App is constructed so the canvas API is ready.
+    let catalog = build_sprite_catalog(&document);
+    app.borrow_mut().sprite_catalog = catalog;
 
     // Stamp the build time below the canvas so the version is always visible.
     if let Some(el) = document.get_element_by_id("build-info") {
@@ -1581,4 +1919,6 @@ pub fn start() {
     wire_text_input(&document, &app);
     wire_help(&document, &app);
     wire_drag_drop(&document, &app);
+    wire_outline_mode(&document, &app);
+    wire_aa_mode(&document, &app);
 }

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0528:1126 -->
+<!-- build: 0528:1336 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -293,6 +293,12 @@
       border-color: var(--accent);
       box-shadow: 0 0 0 1px var(--accent);
     }
+    /* Disabled: no background image loaded yet — dimmed and non-interactive. */
+    .pal-char.disabled {
+      opacity: 0.35;
+      pointer-events: none;
+      cursor: default;
+    }
 
     /* Visual separator between palette groups */
     .pal-sep {
@@ -456,6 +462,15 @@
         <div class="tool" data-tool="oval"      title="Oval"        data-help="oval">○</div>
         <div class="tool" data-tool="oval-fill" title="Filled Oval" data-help="oval-fill">●</div>
       </div>
+      <div class="tool-sep"></div>
+      <!-- Image processing tools — operate on the dropped background image -->
+      <div class="tool-row">
+        <!-- Cycles: Original (▒) → White on black (┼) → Black on white (╬) -->
+        <div class="tool" id="outline-mode-btn"
+             title="Background: Original — tap to cycle"
+             data-help="outline-mode">▒</div>
+        <div class="tool-empty"></div>
+      </div>
     </div>
 
     <div id="canvas-wrap">
@@ -470,7 +485,15 @@
   <!-- Palette entries are created programmatically by Rust (build_palette) -->
   <!-- data-help="palette" on the container: find_help_key walks up to this when -->
   <!-- hovering any palette item, showing one shared help entry for the whole strip. -->
-  <div id="palette" data-help="palette"></div>
+  <div id="palette" data-help="palette">
+    <!-- AA brush mode toggle — disabled until a background image is dropped.
+         🎨︎ uses the text-presentation selector (U+FE0E) to request a monochrome
+         glyph; falls back to colour emoji on unsupporting platforms. -->
+    <div id="aa-mode-btn" class="pal-char disabled"
+         title="AA brush — paint characters matched to background image (drop an image first)"
+         data-help="aa-mode">🎨︎</div>
+    <div class="pal-sep"></div>
+  </div>
 
   <!-- Hidden input: focused by Rust when the text tool is active to raise the
        mobile virtual keyboard. autocorrect/autocapitalize off to prevent the

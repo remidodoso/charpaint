@@ -20,3 +20,5 @@ copy: "Copy — copies the canvas as plain text to the clipboard. If a region is
 clear: "Clear — erases the canvas. If a region is selected, erases only that region. Always undoable."
 theme: "Theme — switches between dark and light colour schemes."
 palette: "Character palette — click to select the character that drawing tools will place on the canvas."
+outline-mode: "Background outline — cycles the dropped image between: Original (grayscale), White on black (bright edges on dark field), and Black on white (dark edges on light field). Edge scale is set to one character cell so structural features are highlighted at AA-conversion granularity."
+aa-mode: "AA brush — when active, every drawing tool places the printable ASCII character that best matches the background image region under the cursor, instead of the fixed palette character. Drop a background image first to enable. Works with all tools: pencil, line, shapes, and flood fill."

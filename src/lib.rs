@@ -13,8 +13,10 @@ use web_sys::{Document, Element, HtmlInputElement, Window};
 mod util;
 use util::bresenham;
 
+mod asciiart;
+
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop};
 
 // Help strings generated from locales/help.en.yaml by build.rs.
 include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
@@ -309,6 +311,21 @@ pub(crate) struct App {
     /// keyboard when a text session is active. Blurred on session end.
     text_input_el: HtmlInputElement,
 
+    /// Blob URL of the current background image, kept for revocation when a new
+    /// image is dropped. None means no background image is active.
+    pub(crate) bg_image_url: Option<String>,
+    /// The background CSS fragment currently applied to #grid (image + overlay gradient).
+    /// Stored so sync_grid_style can regenerate the full inline style string combining
+    /// this with font_size whenever either changes.
+    bg_image_css: Option<String>,
+
+    /// Full-resolution luminance data extracted from the dropped image and
+    /// range-stretched by the AA pipeline. Indexed [row * bg_luma_width + col].
+    /// None until an image has been dropped and processed.
+    pub(crate) bg_luma:        Option<Vec<u8>>,
+    pub(crate) bg_luma_width:  u32,
+    pub(crate) bg_luma_height: u32,
+
     /// True while the help-mode overlay is active.
     /// When on, pointer events are captured by #help-overlay and routed to
     /// the help popup instead of the canvas/toolbar.
@@ -352,6 +369,11 @@ impl App {
             pinch_start_dist:      0.0,
             pinch_start_font_size: 16.0,
             pan_last_mid:          (0.0, 0.0),
+            bg_image_url:          None,
+            bg_image_css:          None,
+            bg_luma:               None,
+            bg_luma_width:         0,
+            bg_luma_height:        0,
             help_mode:             false,
         }
     }
@@ -886,13 +908,166 @@ impl App {
 
     // ── Touch / zoom ─────────────────────────────────────────────────────────
 
+    /// Regenerate the full inline style string for #grid from current state and apply it.
+    /// Called by set_font_size and apply_bg_image so they never overwrite each other.
+    fn sync_grid_style(&self) {
+        let mut style = format!("font-size: {}px", self.font_size);
+        if let Some(ref bg_css) = self.bg_image_css {
+            style.push_str("; ");
+            style.push_str(bg_css);
+        }
+        let _ = self.grid_el.set_attribute("style", &style);
+    }
+
     /// Set the grid font size, clamped to 8–48 px, and apply it to the DOM.
     /// Called on every pinch-zoom touchmove frame.
     pub(crate) fn set_font_size(&mut self, size: f64) {
         self.font_size = size.max(8.0).min(48.0);
-        self.grid_el
-            .set_attribute("style", &format!("font-size: {}px", self.font_size))
-            .unwrap();
+        self.sync_grid_style();
+    }
+
+    /// Apply a background image to #grid. The image is shown at 50% opacity by
+    /// layering an overlay gradient matching the canvas background colour.
+    /// Revokes the previous blob URL if one was active.
+    ///
+    /// `bg_size`: either "cover" or an explicit "WIDTHpx HEIGHTpx" when the image
+    /// is too small to cover at 2× magnification.
+    /// `overlay`: a CSS rgba() colour matching the active theme's canvas background
+    /// at 50% opacity, e.g. "rgba(13,13,13,0.5)" for dark theme.
+    pub(crate) fn apply_bg_image(&mut self, url: String, bg_size: String, overlay: &str) {
+        if let Some(ref old) = self.bg_image_url {
+            let _ = web_sys::Url::revoke_object_url(old);
+        }
+        self.bg_image_url = Some(url.clone());
+        // Two-layer background: solid colour overlay on top of image.
+        // The overlay colour is the canvas background at 50% opacity so the image
+        // reads as ghostly while drawn characters (at full opacity) stay legible.
+        self.bg_image_css = Some(format!(
+            "background-image: linear-gradient({overlay}, {overlay}), url({url}); \
+             background-size: {bg_size}; background-position: center; \
+             background-repeat: no-repeat"
+        ));
+        self.sync_grid_style();
+    }
+
+    /// Full AA image pipeline: extract pixels, convert to luminance, stretch,
+    /// render the processed grayscale back to the canvas, and set it as the
+    /// #grid background. The stretched luma array is stored for the AA step.
+    ///
+    /// `blob_url` is the `createObjectURL` URL for the original colour image.
+    /// It is revoked immediately after pixel extraction — the background CSS
+    /// uses a grayscale data URL derived from the processed pixels instead.
+    ///
+    /// Blob URLs are same-origin, so `getImageData` is not blocked by the
+    /// canvas taint check.
+    pub(crate) fn process_bg_image(&mut self, img_el: &web_sys::HtmlImageElement, blob_url: &str) {
+        let nw = img_el.natural_width();
+        let nh = img_el.natural_height();
+        if nw == 0 || nh == 0 { return; }
+
+        let document = match web_sys::window().and_then(|w| w.document()) {
+            Some(d) => d,
+            None    => return,
+        };
+
+        // Off-screen canvas — never inserted into the DOM; pixel scratch buffer.
+        let canvas = match document
+            .create_element("canvas")
+            .ok()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+        {
+            Some(c) => c,
+            None    => return,
+        };
+        // Scale to processing resolution: height clamped to [MIN, MAX], width proportional.
+        let target_h = (nh as f64)
+            .max(asciiart::PROCESSED_MIN_HEIGHT as f64)
+            .min(asciiart::PROCESSED_MAX_HEIGHT as f64);
+        let scale  = target_h / nh as f64;
+        let proc_w = (nw as f64 * scale).round() as u32;
+        let proc_h = target_h as u32;
+
+        canvas.set_width(proc_w);
+        canvas.set_height(proc_h);
+
+        let ctx = match canvas
+            .get_context("2d")
+            .ok()
+            .flatten()
+            .and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+        {
+            Some(c) => c,
+            None    => return,
+        };
+
+        if ctx.draw_image_with_html_image_element_and_dw_and_dh(
+            img_el, 0.0, 0.0, proc_w as f64, proc_h as f64,
+        ).is_err() {
+            return;
+        }
+
+        let image_data = match ctx.get_image_data(0.0, 0.0, proc_w as f64, proc_h as f64) {
+            Ok(d)  => d,
+            Err(_) => return,
+        };
+
+        // Original colour image no longer needed — revoke its blob URL now.
+        let _ = web_sys::Url::revoke_object_url(blob_url);
+
+        // ImageData::data() returns Clamped<Vec<u8>> — unwrap the newtype.
+        let rgba = image_data.data().0;
+        let mut luma = asciiart::to_luminance(&rgba);
+        asciiart::stretch_luminance(&mut luma);
+
+        // Build grayscale RGBA: R=G=B=L, A=255.
+        let mut gray_rgba = vec![0u8; luma.len() * 4];
+        for (i, &l) in luma.iter().enumerate() {
+            gray_rgba[i * 4    ] = l;
+            gray_rgba[i * 4 + 1] = l;
+            gray_rgba[i * 4 + 2] = l;
+            gray_rgba[i * 4 + 3] = 255;
+        }
+
+        // Write grayscale pixels back to the canvas and export as a data URL.
+        // Clamped<&[u8]> is the type this web-sys version expects — no unsafe needed.
+        let new_image_data = match web_sys::ImageData::new_with_u8_clamped_array_and_sh(
+            wasm_bindgen::Clamped(&gray_rgba[..]), proc_w, proc_h,
+        ) {
+            Ok(d)  => d,
+            Err(_) => return,
+        };
+        if ctx.put_image_data(&new_image_data, 0.0, 0.0).is_err() { return; }
+        let data_url = match canvas.to_data_url() {
+            Ok(u)  => u,
+            Err(_) => return,
+        };
+
+        // Display size: cover the grid, capped at 2× natural size.
+        let (grid_w, grid_h) = document
+            .get_element_by_id("grid")
+            .map(|g| (g.client_width() as f64, g.client_height() as f64))
+            .unwrap_or((640.0, 384.0));
+
+        let bg_size = {
+            let cover_scale = (grid_w / proc_w as f64).max(grid_h / proc_h as f64);
+            if cover_scale <= 2.0 {
+                "cover".to_string()
+            } else {
+                format!("{}px {}px", (proc_w as f64 * 2.0).round(), (proc_h as f64 * 2.0).round())
+            }
+        };
+
+        let overlay = if self.dark_mode {
+            "rgba(13,13,13,0.5)"    // --canvas-bg dark  = #0d0d0d
+        } else {
+            "rgba(255,255,255,0.5)" // --canvas-bg light = #ffffff
+        };
+
+        self.apply_bg_image(data_url, bg_size, overlay);
+
+        self.bg_luma        = Some(luma);
+        self.bg_luma_width  = proc_w;
+        self.bg_luma_height = proc_h;
     }
 
     // ── Help mode ────────────────────────────────────────────────────────────
@@ -1405,4 +1580,5 @@ pub fn start() {
     wire_shift_toggle(&document, &app);
     wire_text_input(&document, &app);
     wire_help(&document, &app);
+    wire_drag_drop(&document, &app);
 }

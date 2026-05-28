@@ -41,8 +41,18 @@ features = [
   "TouchEvent",    # type for touch event handlers
   "Touch",         # individual touch point within a TouchEvent
   "TouchList",     # collection of Touch objects (e.touches(), etc.)
-  "DomRect",       # bounding rect returned by getBoundingClientRect — used for pinch-zoom scroll correction
-  "PointerEvent",  # unified pointer events used by the help-mode overlay (desktop hover + mobile tap)
+  "DomRect",        # bounding rect returned by getBoundingClientRect — used for pinch-zoom scroll correction
+  "PointerEvent",   # unified pointer events used by the help-mode overlay (desktop hover + mobile tap)
+  "DragEvent",      # drop/dragover event type for image drag-and-drop
+  "DataTransfer",   # e.data_transfer() — carries dropped files
+  "FileList",       # data_transfer.files() result
+  "File",           # individual dropped file; type_() for MIME check
+  "Blob",           # File inherits Blob; needed for create_object_url_with_blob
+  "Url",            # Url::create_object_url_with_blob / revoke_object_url
+  "HtmlImageElement",        # temp off-screen img element to measure natural_width/height
+  "HtmlCanvasElement",       # off-screen canvas for pixel extraction (AA pipeline)
+  "CanvasRenderingContext2d", # drawImage + getImageData on the scratch canvas
+  "ImageData",               # getImageData return type; .data() yields Uint8ClampedArray
 ]
 
 # chrono runs only on the host at compile time (build.rs) — never touches the WASM output.

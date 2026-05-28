@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, Element, Event, KeyboardEvent, MouseEvent, NodeList, PointerEvent, TouchEvent, Window};
+use web_sys::{Document, DragEvent, Element, Event, KeyboardEvent, MouseEvent, NodeList, PointerEvent, TouchEvent, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
@@ -1097,4 +1097,111 @@ fn find_help_key(el: &Element) -> Option<String> {
         current = e.parent_element();
     }
     None
+}
+
+/// Wire drag-and-drop of image files onto `#canvas-wrap`.
+///
+/// Dropping an image file (from the desktop or file manager) displays it as a
+/// ghostly background behind the character grid. The image is shown at ~50%
+/// opacity via a CSS gradient overlay layered over it on `#grid`.
+///
+/// Magnification is capped at 2×: if `background-size: cover` would scale the
+/// image more than 2× its natural size, an explicit pixel size is used instead
+/// and the image is centred, leaving canvas-bg colour at the edges.
+///
+/// Dropping a second image replaces the first (old blob URL is revoked).
+/// To clear the background the user reloads the page; toolbar controls TBD.
+pub fn wire_drag_drop(document: &Document, app: &Rc<RefCell<App>>) {
+    let canvas_wrap = match document.get_element_by_id("canvas-wrap") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // Window-level dragover + drop suppressors: without these, Firefox (and other
+    // browsers) intercept any drag that lands outside #canvas-wrap and open the
+    // file as a new tab. preventDefault() at the window level opts the whole page
+    // out of that behaviour. The canvas-wrap drop handler below still fires for
+    // drops on the canvas; everything else is silently swallowed here.
+    {
+        let window = web_sys::window().unwrap();
+        let cb = Closure::<dyn FnMut(DragEvent)>::new(|e: DragEvent| { e.prevent_default(); });
+        window.add_event_listener_with_callback("dragover", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+    {
+        let window = web_sys::window().unwrap();
+        let cb = Closure::<dyn FnMut(DragEvent)>::new(|e: DragEvent| { e.prevent_default(); });
+        window.add_event_listener_with_callback("drop", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // dragover on canvas-wrap — required for the canvas-specific `drop` to fire.
+    {
+        let cb = Closure::<dyn FnMut(DragEvent)>::new(|e: DragEvent| {
+            e.prevent_default();
+        });
+        canvas_wrap
+            .add_event_listener_with_callback("dragover", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
+    // drop — read the file, create a blob URL, measure natural dimensions via a
+    // temporary off-screen img element, then apply the background.
+    {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut(DragEvent)>::new(move |e: DragEvent| {
+            e.prevent_default();
+
+            // Pull the first file out of the drag payload.
+            let file = e
+                .data_transfer()
+                .and_then(|dt| dt.files())
+                .and_then(|fl| fl.get(0));
+            let file = match file {
+                Some(f) => f,
+                None    => return,
+            };
+
+            // Only accept image/* — reject text, PDFs, etc.
+            if !file.type_().starts_with("image/") {
+                return;
+            }
+
+            // Synchronously create a blob: URL; no FileReader round-trip needed.
+            // The previous URL (if any) is revoked inside apply_bg_image.
+            let url = match web_sys::Url::create_object_url_with_blob(file.as_ref()) {
+                Ok(u)  => u,
+                Err(_) => return,
+            };
+
+            // Temporary off-screen img element so we can read naturalWidth/Height.
+            // It never enters the DOM — onload fires regardless.
+            let img_el = match web_sys::HtmlImageElement::new() {
+                Ok(el) => el,
+                Err(_) => return,
+            };
+
+            let app_2 = Rc::clone(&app);
+            let url_2 = url.clone();
+            let img_2 = img_el.clone();
+
+            // One-shot closure: process_bg_image owns the full pipeline —
+            // pixel extraction, luma conversion, stretch, grayscale render,
+            // data-URL creation, background display, and luma storage.
+            let on_load = Closure::once_into_js(move || {
+                app_2.borrow_mut().process_bg_image(&img_2, &url_2);
+            });
+
+            img_el
+                .add_event_listener_with_callback("load", on_load.unchecked_ref())
+                .unwrap();
+            // Setting src after the listener is registered — guaranteed ordering.
+            img_el.set_src(&url);
+        });
+        canvas_wrap
+            .add_event_listener_with_callback("drop", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
 }

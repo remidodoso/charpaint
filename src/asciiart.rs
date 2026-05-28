@@ -118,14 +118,26 @@ pub fn stretch_luminance(luma: &mut [u8]) {
     }
 }
 
-/// Find the catalog sprite (0 = ASCII 32 = space, 94 = ASCII 126 = '~') whose
-/// grayscale bitmap most closely matches `patch` by minimum sum-of-squared differences.
-/// Both `patch` and every sprite must be SPRITE_W × SPRITE_H bytes.
+/// Minimum patch-max value (0–255) for the "must place a non-space character" rule.
+/// If the maximum pixel value in the downsampled edge patch meets or exceeds this
+/// threshold, space (catalog index 0) is excluded from the SSD search. Cells below
+/// the threshold participate in normal matching — space may or may not win naturally.
+pub(crate) const AA_EDGE_THRESHOLD: u8 = 35;
+
+
+/// Find the catalog sprite whose grayscale bitmap most closely matches `patch`
+/// by minimum sum-of-squared differences. Both `patch` and every sprite must be
+/// SPRITE_W × SPRITE_H bytes.
+///
+/// `min_idx` sets the first candidate index. Pass `0` to allow space (index 0 =
+/// ASCII 32); pass `1` to exclude it when a non-blank character is required.
+///
 /// Returns the index of the best match; caller maps it back to a char via `idx + 32`.
-pub fn best_sprite_match(patch: &[u8], sprites: &[Vec<u8>]) -> usize {
-    let mut best_idx   = 0;
+pub fn best_sprite_match(patch: &[u8], sprites: &[Vec<u8>], min_idx: usize) -> usize {
+    let start          = min_idx.min(sprites.len().saturating_sub(1));
+    let mut best_idx   = start;
     let mut best_score = f32::MAX;
-    for (i, sprite) in sprites.iter().enumerate() {
+    for (i, sprite) in sprites.iter().enumerate().skip(start) {
         let score: f32 = patch.iter().zip(sprite.iter())
             .map(|(&a, &b)| { let d = a as f32 - b as f32; d * d })
             .sum();

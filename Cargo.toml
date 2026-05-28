@@ -53,6 +53,7 @@ features = [
   "HtmlCanvasElement",       # off-screen canvas for pixel extraction (AA pipeline)
   "CanvasRenderingContext2d", # drawImage + getImageData on the scratch canvas
   "ImageData",               # getImageData return type; .data() yields Uint8ClampedArray
+  "WheelEvent",              # scroll-to-zoom on background image (BgMove tool)
 ]
 
 # chrono runs only on the host at compile time (build.rs) — never touches the WASM output.

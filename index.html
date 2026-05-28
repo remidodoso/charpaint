@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0528:1336 -->
+<!-- build: 0528:1552 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -465,11 +465,25 @@
       <div class="tool-sep"></div>
       <!-- Image processing tools — operate on the dropped background image -->
       <div class="tool-row">
+        <!-- Eye toggle: highlighted = background visible, un-highlighted = hidden.
+             Disabled until an image is dropped; resets to visible on each new drop. -->
+        <div class="tool disabled" id="bg-visibility-btn"
+             title="Show/hide background image"
+             data-help="bg-visibility">👁</div>
         <!-- Cycles: Original (▒) → White on black (┼) → Black on white (╬) -->
         <div class="tool" id="outline-mode-btn"
              title="Background: Original — tap to cycle"
              data-help="outline-mode">▒</div>
-        <div class="tool-empty"></div>
+      </div>
+      <div class="tool-row">
+        <!-- BgMove: drag to pan, scroll to zoom background image -->
+        <div class="tool" id="bg-move-btn" data-tool="bg-move"
+             title="Move/resize background — drag to pan, scroll wheel to zoom"
+             data-help="bg-move">✥</div>
+        <!-- Load image from file — triggers native file picker on click -->
+        <div class="tool" id="load-image-btn"
+             title="Load background image from file"
+             data-help="load-image">🖼</div>
       </div>
     </div>
 
@@ -501,6 +515,11 @@
   <input id="text-input" type="text"
          autocomplete="off" autocorrect="off"
          autocapitalize="off" spellcheck="false">
+
+  <!-- Hidden file input: programmatically clicked by the load-image-btn toolbar
+       button to open the native file picker. display:none is safe here because
+       we trigger it via .click() within a user-gesture handler, not via focus. -->
+  <input id="image-file-input" type="file" accept="image/*" style="display:none">
 
   <!-- Help mode overlay: full-screen transparent layer that captures pointer events.
        Rust briefly sets pointer-events:none before elementFromPoint so the element

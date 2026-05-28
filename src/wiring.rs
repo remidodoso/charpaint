@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{Document, DragEvent, Element, Event, KeyboardEvent, MouseEvent, NodeList, PointerEvent, TouchEvent, Window};
+use web_sys::{Document, DragEvent, Element, Event, KeyboardEvent, MouseEvent, NodeList, PointerEvent, TouchEvent, WheelEvent, Window};
 
 use wasm_bindgen_futures::spawn_local;
 
@@ -32,6 +32,13 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
             if let Some((col, row)) = cell_from_mouse_event(&e) {
                 let mut a = app.borrow_mut();
                 a.clear_demo_if_active(); // wipe intro content before first undo snapshot
+                // BgMove: pan background — no canvas painting, no undo snapshot.
+                if a.tool == Tool::BgMove {
+                    if a.bg_image_url.is_some() {
+                        a.start_bg_drag(e.client_x() as f64, e.client_y() as f64);
+                    }
+                    return;
+                }
                 // Text tool: start (or move) the text session; no stroke state needed.
                 if a.tool == Tool::Text {
                     a.start_text_session(col, row);
@@ -60,6 +67,11 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
         let app = Rc::clone(app);
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
             let mut a = app.borrow_mut();
+            // BgMove: update pan position regardless of is_drawing.
+            if a.tool == Tool::BgMove {
+                a.update_bg_drag(e.client_x() as f64, e.client_y() as f64);
+                return;
+            }
             if !a.is_drawing {
                 return;
             }
@@ -79,12 +91,44 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
         let app = Rc::clone(app);
         let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |_e: MouseEvent| {
             let mut a = app.borrow_mut();
+            // BgMove: end drag — no stroke to commit.
+            if a.tool == Tool::BgMove {
+                a.end_bg_drag();
+                return;
+            }
             if a.is_drawing {
                 a.commit_stroke();
             }
         });
         window
             .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
+    // wheel on grid — scroll-to-zoom background when BgMove is active
+    {
+        let app        = Rc::clone(app);
+        let grid_clone = grid_el.clone();
+        let cb = Closure::<dyn FnMut(WheelEvent)>::new(move |e: WheelEvent| {
+            {
+                let a = app.borrow();
+                if a.tool != Tool::BgMove || a.bg_image_url.is_none() { return; }
+            }
+            e.prevent_default(); // stop page scroll while zooming the image
+            let rect    = grid_clone.get_bounding_client_rect();
+            let pivot_x = e.client_x() as f64 - rect.left();
+            let pivot_y = e.client_y() as f64 - rect.top();
+            // Normalise delta: lines/pages are converted to approximate pixel equivalents.
+            let delta = match e.delta_mode() {
+                0 => e.delta_y(),
+                1 => e.delta_y() * 30.0,
+                _ => e.delta_y() * 300.0,
+            };
+            app.borrow_mut().zoom_bg_image(delta, pivot_x, pivot_y);
+        });
+        grid_el
+            .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
             .unwrap();
         cb.forget();
     }
@@ -110,8 +154,8 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
             None => continue,
         };
 
-        // Line and Fill have sub-modes and tap-to-cycle; wired separately.
-        if tool == Tool::Line || tool == Tool::Fill { continue; }
+        // Line, Fill, and BgMove have custom activation behaviour; wired separately.
+        if tool == Tool::Line || tool == Tool::Fill || tool == Tool::BgMove { continue; }
 
         let app       = Rc::clone(app);
         let el_clone  = el.clone();
@@ -252,6 +296,12 @@ pub fn wire_undo_redo(document: &Document, app: &Rc<RefCell<App>>) {
                 }
             }
 
+            // BgMove: Enter accepts the current layout and exits the tool.
+            if key == "Enter" && app.borrow().tool == Tool::BgMove {
+                app.borrow_mut().accept_bg_move();
+                return;
+            }
+
             // Standard global shortcuts.
             if (key == "z" || key == "Z") && e.ctrl_key() {
                 e.prevent_default(); // suppress browser's own undo in editable fields
@@ -263,9 +313,11 @@ pub fn wire_undo_redo(document: &Document, app: &Rc<RefCell<App>>) {
                     if let Some(ref el) = btn_undo { flash_button(el); }
                 }
             } else if key == "Escape" {
-                // Cancel any in-progress stroke — preview discarded, no undo entry.
                 let mut a = app.borrow_mut();
-                if a.is_drawing {
+                if a.tool == Tool::BgMove {
+                    // Cancel BgMove: revert layout to snapshot taken at entry.
+                    a.cancel_bg_move();
+                } else if a.is_drawing {
                     a.abort_stroke();
                 }
             }
@@ -691,6 +743,13 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                         return;
                     }
                     let t = touches.get(0).unwrap();
+                    // BgMove: single-finger pan — no cell coords needed; don't clear demo.
+                    if a.tool == Tool::BgMove {
+                        if a.bg_image_url.is_some() {
+                            a.start_bg_drag(t.client_x() as f64, t.client_y() as f64);
+                        }
+                        return;
+                    }
                     if let Some((col, row)) = cell_from_coords(
                         t.client_x() as f64, t.client_y() as f64, &doc,
                     ) {
@@ -724,9 +783,11 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                     let (x1, y1) = (t1.client_x() as f64, t1.client_y() as f64);
                     let dx = x1 - x0;
                     let dy = y1 - y0;
-                    a.pinch_start_dist      = (dx * dx + dy * dy).sqrt();
-                    a.pinch_start_font_size = a.font_size;
-                    a.pan_last_mid          = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                    a.pinch_start_dist        = (dx * dx + dy * dy).sqrt();
+                    a.pinch_start_font_size   = a.font_size;
+                    a.pinch_start_bg_disp_w   = a.bg_disp_w; // for BgMove pinch
+                    a.pan_last_mid            = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                    a.end_bg_drag(); // cancel any in-progress single-finger bg pan
                 }
                 _ => {}
             }
@@ -739,14 +800,23 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
 
     // ── touchmove ────────────────────────────────────────────────────────────
     {
-        let app  = Rc::clone(app);
-        let doc  = document.clone();
-        let wrap = wrap_el.clone();
+        let app        = Rc::clone(app);
+        let doc        = document.clone();
+        let wrap       = wrap_el.clone();
+        let grid_clone = grid_el.clone(); // for BgMove pinch pivot calculation
         let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
             let touches = e.touches();
             match touches.length() {
                 1 => {
                     let mut a = app.borrow_mut();
+                    // BgMove: single-finger pan (suppressed during two-finger recovery).
+                    if a.tool == Tool::BgMove {
+                        if !a.is_two_finger {
+                            let t = touches.get(0).unwrap();
+                            a.update_bg_drag(t.client_x() as f64, t.client_y() as f64);
+                        }
+                        return;
+                    }
                     if !a.is_drawing { return; }
                     let t = touches.get(0).unwrap();
                     if let Some((col, row)) = cell_from_coords(
@@ -766,44 +836,63 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                     let mid_x    = (x0 + x1) / 2.0;
                     let mid_y    = (y0 + y1) / 2.0;
 
-                    // Short immutable borrow: read pinch/pan state, compute deltas.
-                    let new_font: f64;
-                    let inc_scale: f64;
-                    let pan_dx: f64;
-                    let pan_dy: f64;
-                    {
-                        let a = app.borrow();
-                        if !a.is_two_finger { return; }
-                        let ratio = if a.pinch_start_dist > 0.0 {
-                            cur_dist / a.pinch_start_dist
-                        } else {
-                            1.0
-                        };
-                        new_font  = (a.pinch_start_font_size * ratio).max(8.0).min(48.0);
-                        inc_scale = new_font / a.font_size; // incremental scale this frame
-                        pan_dx    = mid_x - a.pan_last_mid.0;
-                        pan_dy    = mid_y - a.pan_last_mid.1;
+                    let is_bg_move = app.borrow().tool == Tool::BgMove;
+
+                    if is_bg_move {
+                        // BgMove: zoom and pan the background image.
+                        let ratio: f64;
+                        let pan_dx: f64;
+                        let pan_dy: f64;
+                        {
+                            let a = app.borrow();
+                            if !a.is_two_finger { return; }
+                            ratio  = if a.pinch_start_dist > 0.0 {
+                                cur_dist / a.pinch_start_dist
+                            } else { 1.0 };
+                            pan_dx = mid_x - a.pan_last_mid.0;
+                            pan_dy = mid_y - a.pan_last_mid.1;
+                        }
+                        let grid_rect = grid_clone.get_bounding_client_rect();
+                        let pivot_x   = mid_x - grid_rect.left();
+                        let pivot_y   = mid_y - grid_rect.top();
+                        {
+                            let mut a = app.borrow_mut();
+                            a.update_bg_from_pinch(ratio, pivot_x, pivot_y, pan_dx, pan_dy);
+                            a.pan_last_mid = (mid_x, mid_y);
+                        }
+                    } else {
+                        // Normal: zoom grid font size and scroll canvas-wrap.
+                        let new_font: f64;
+                        let inc_scale: f64;
+                        let pan_dx: f64;
+                        let pan_dy: f64;
+                        {
+                            let a = app.borrow();
+                            if !a.is_two_finger { return; }
+                            let ratio = if a.pinch_start_dist > 0.0 {
+                                cur_dist / a.pinch_start_dist
+                            } else { 1.0 };
+                            new_font  = (a.pinch_start_font_size * ratio).max(8.0).min(48.0);
+                            inc_scale = new_font / a.font_size;
+                            pan_dx    = mid_x - a.pan_last_mid.0;
+                            pan_dy    = mid_y - a.pan_last_mid.1;
+                        }
+                        // Scroll correction: keep the pinch midpoint stationary as zoom changes.
+                        let wrap_rect = wrap.get_bounding_client_rect();
+                        let mid_vp_x  = mid_x - wrap_rect.left();
+                        let mid_vp_y  = mid_y - wrap_rect.top();
+                        let old_sl    = wrap.scroll_left() as f64;
+                        let old_st    = wrap.scroll_top()  as f64;
+                        let new_sl = (old_sl * inc_scale + mid_vp_x * (inc_scale - 1.0) - pan_dx).max(0.0);
+                        let new_st = (old_st * inc_scale + mid_vp_y * (inc_scale - 1.0) - pan_dy).max(0.0);
+                        {
+                            let mut a = app.borrow_mut();
+                            a.set_font_size(new_font);
+                            a.pan_last_mid = (mid_x, mid_y);
+                        }
+                        wrap.set_scroll_left(new_sl.round() as i32);
+                        wrap.set_scroll_top(new_st.round()  as i32);
                     }
-
-                    // Scroll correction: keep the content point under the pinch midpoint
-                    // stationary as zoom changes, then shift by the pan delta.
-                    // mid_vp = midpoint relative to canvas-wrap's top-left corner.
-                    let wrap_rect = wrap.get_bounding_client_rect();
-                    let mid_vp_x  = mid_x - wrap_rect.left();
-                    let mid_vp_y  = mid_y - wrap_rect.top();
-                    let old_sl    = wrap.scroll_left() as f64;
-                    let old_st    = wrap.scroll_top()  as f64;
-                    let new_sl = (old_sl * inc_scale + mid_vp_x * (inc_scale - 1.0) - pan_dx).max(0.0);
-                    let new_st = (old_st * inc_scale + mid_vp_y * (inc_scale - 1.0) - pan_dy).max(0.0);
-
-                    {
-                        let mut a = app.borrow_mut();
-                        a.set_font_size(new_font);
-                        a.pan_last_mid = (mid_x, mid_y);
-                    }
-
-                    wrap.set_scroll_left(new_sl.round() as i32);
-                    wrap.set_scroll_top(new_st.round()  as i32);
                 }
                 _ => {}
             }
@@ -822,9 +911,11 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
         let app    = Rc::clone(app);
         let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
             if e.touches().length() == 0 {
-                // All fingers off — commit any stroke and exit two-finger guard.
+                // All fingers off — commit/end any active interaction.
                 let mut a = app.borrow_mut();
-                if a.is_drawing {
+                if a.tool == Tool::BgMove {
+                    a.end_bg_drag();
+                } else if a.is_drawing {
                     a.commit_stroke();
                 }
                 a.is_two_finger = false;
@@ -846,7 +937,9 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
         let app    = Rc::clone(app);
         let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
             let mut a = app.borrow_mut();
-            if a.is_drawing {
+            if a.tool == Tool::BgMove {
+                a.end_bg_drag();
+            } else if a.is_drawing {
                 a.abort_stroke();
             }
             a.is_two_finger = false;
@@ -1312,6 +1405,57 @@ pub fn wire_aa_mode(document: &Document, app: &Rc<RefCell<App>>) {
     }
 }
 
+/// Wire the `#bg-visibility-btn` eye toggle.
+///
+/// Highlighted (active) = background visible; un-highlighted = hidden.
+/// Image data and edge map are always preserved — AA brush unaffected.
+/// Button starts disabled; process_bg_image enables it and sets it active
+/// (visible) every time an image is successfully loaded.
+///
+/// Same three-listener pattern as other mode buttons.
+pub fn wire_bg_visibility(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("bg-visibility-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse chain.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — toggle for touch.
+    {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            app.borrow_mut().toggle_bg_visibility();
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — toggle for desktop, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            app.borrow_mut().toggle_bg_visibility();
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
 fn aa_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
     let mut a = app.borrow_mut();
     a.aa_mode = !a.aa_mode;
@@ -1324,6 +1468,152 @@ fn aa_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
 
 /// Shared action for touch and mouse outline-mode taps.
 /// Cycles bg_outline_mode, updates the button, and re-renders the background.
+/// Wire the `#bg-move-btn` background pan/zoom tool.
+///
+/// First tap: enters BgMove mode — saves current tool and layout, activates the button.
+/// Second tap (already in BgMove): accepts current layout and returns to the previous tool.
+/// ESC cancels (reverts layout) and Enter accepts — both handled in wire_undo_redo.
+pub fn wire_bg_move_tool(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("bg-move-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse chain.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — enter or accept for touch.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            bg_move_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — enter or accept for desktop, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            bg_move_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// First tap: enter BgMove mode and move `.active` to the BgMove button.
+/// Second tap: accept current layout, restore prev_tool's active class (done inside accept_bg_move).
+/// Wire `#load-image-btn` to the native file picker.
+///
+/// A `click` on the button programmatically fires `.click()` on the hidden
+/// `#image-file-input` element, which opens the OS file browser (or photo
+/// library on mobile). The `change` event on the input runs the same
+/// blob-URL → HtmlImageElement → process_bg_image pipeline as drag-and-drop.
+///
+/// A plain `click` listener is used here (rather than mousedown/touchend)
+/// because calling `.click()` on a file input must happen synchronously within
+/// a user-gesture event; `click` is the safest cross-browser choice for this.
+pub fn wire_load_image(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("load-image-btn") {
+        Some(el) => el,
+        None => return,
+    };
+    let file_input = match document
+        .get_element_by_id("image-file-input")
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        Some(el) => el,
+        None => return,
+    };
+
+    // Button click → open file picker.
+    {
+        let file_input_clone = file_input.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let _ = file_input_clone.click();
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // File selected → process exactly like a drag-and-drop.
+    {
+        let app              = Rc::clone(app);
+        let file_input_clone = file_input.clone();
+        let cb = Closure::<dyn FnMut(Event)>::new(move |_e: Event| {
+            let file = match file_input_clone.files().and_then(|fl| fl.get(0)) {
+                Some(f) => f,
+                None    => return,
+            };
+            if !file.type_().starts_with("image/") { return; }
+
+            let url = match web_sys::Url::create_object_url_with_blob(file.as_ref()) {
+                Ok(u)  => u,
+                Err(_) => return,
+            };
+            let img_el = match web_sys::HtmlImageElement::new() {
+                Ok(el) => el,
+                Err(_) => return,
+            };
+
+            let app_2  = Rc::clone(&app);
+            let url_2  = url.clone();
+            let img_2  = img_el.clone();
+            let on_load = Closure::once_into_js(move || {
+                app_2.borrow_mut().process_bg_image(&img_2, &url_2);
+            });
+            img_el.add_event_listener_with_callback("load", on_load.unchecked_ref()).unwrap();
+            img_el.set_src(&url);
+
+            // Reset value so selecting the same file again still fires `change`.
+            file_input_clone.set_value("");
+        });
+        file_input.add_event_listener_with_callback("change", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+fn bg_move_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
+    let already_active = app.borrow().tool == Tool::BgMove;
+
+    if already_active {
+        // Accept current layout and return to the previous tool.
+        app.borrow_mut().accept_bg_move();
+    } else {
+        {
+            let mut a = app.borrow_mut();
+            a.commit_text_session();
+            a.clear_selection();
+            a.enter_bg_move(); // saves prev_tool + layout, sets tool = BgMove
+        }
+        // Move `.active` to the BgMove button.
+        let all = document.query_selector_all("[data-tool]").unwrap();
+        for i in 0..all.length() {
+            let t: Element = all.item(i).unwrap().dyn_into().unwrap();
+            t.class_list().remove_1("active").unwrap();
+        }
+        btn.class_list().add_1("active").unwrap();
+    }
+}
+
 fn outline_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
     let mode = {
         let mut a = app.borrow_mut();

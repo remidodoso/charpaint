@@ -16,7 +16,7 @@ use util::bresenham;
 mod asciiart;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode, wire_bg_visibility, wire_bg_move_tool, wire_load_image};
 
 // Help strings generated from locales/help.en.yaml by build.rs.
 include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
@@ -198,9 +198,28 @@ pub(crate) enum Tool {
     RectFill,
     Oval,
     OvalFill,
+    BgMove,   // pan/zoom the background image; no canvas painting
 }
 
 impl Tool {
+    /// Map a Tool variant back to its `data-tool` HTML attribute value.
+    /// Used when restoring the `.active` class to the previous tool's button.
+    pub(crate) fn data_attr(&self) -> &'static str {
+        match self {
+            Tool::Pencil   => "pencil",
+            Tool::Eraser   => "eraser",
+            Tool::Select   => "select",
+            Tool::Fill     => "fill",
+            Tool::Text     => "text",
+            Tool::Line     => "line",
+            Tool::Rect     => "rect",
+            Tool::RectFill => "rect-fill",
+            Tool::Oval     => "oval",
+            Tool::OvalFill => "oval-fill",
+            Tool::BgMove   => "bg-move",
+        }
+    }
+
     /// Map the `data-tool` HTML attribute value to a Tool variant.
     pub(crate) fn from_data_attr(s: &str) -> Option<Self> {
         match s {
@@ -214,6 +233,7 @@ impl Tool {
             "rect-fill" => Some(Tool::RectFill),
             "oval"      => Some(Tool::Oval),
             "oval-fill" => Some(Tool::OvalFill),
+            "bg-move"   => Some(Tool::BgMove),
             _           => None,
         }
     }
@@ -353,10 +373,24 @@ pub(crate) struct App {
     /// Blob URL of the current background image, kept for revocation when a new
     /// image is dropped. None means no background image is active.
     pub(crate) bg_image_url: Option<String>,
-    /// The background CSS fragment currently applied to #grid (image + overlay gradient).
-    /// Stored so sync_grid_style can regenerate the full inline style string combining
-    /// this with font_size whenever either changes.
-    bg_image_css: Option<String>,
+    /// Displayed dimensions of the background image in CSS pixels. Set to cover+center
+    /// on image drop, then updated interactively by the BgMove tool.
+    pub(crate) bg_disp_w: f64,
+    pub(crate) bg_disp_h: f64,
+    /// Position of the image's top-left corner in CSS grid pixels. Negative values
+    /// are valid — the image can be partially panned off the grid.
+    pub(crate) bg_pos_x: f64,
+    pub(crate) bg_pos_y: f64,
+    /// Drag origin for the BgMove tool: (client_x, client_y, bg_pos_x, bg_pos_y)
+    /// at the moment mousedown fired. None when not dragging.
+    bg_drag_start: Option<(f64, f64, f64, f64)>,
+    /// Background display width captured at pinch-start. Used in touchmove to
+    /// compute the absolute scale ratio (pinch_start_bg_disp_w × ratio = new width).
+    pub(crate) pinch_start_bg_disp_w: f64,
+    /// Tool that was active before BgMove was entered. Restored on accept/cancel/exit.
+    pub(crate) prev_tool: Option<Tool>,
+    /// Background layout snapshot taken when BgMove was entered. Restored on ESC.
+    bg_move_saved: Option<(f64, f64, f64, f64)>,
 
     /// Full-resolution luminance data extracted from the dropped image and
     /// range-stretched by the AA pipeline. Indexed [row * bg_luma_width + col].
@@ -370,6 +404,12 @@ pub(crate) struct App {
     /// against inverted sprites (white strokes on black) via SSD, so character
     /// stroke directions align with edge directions in the image.
     pub(crate) bg_edges: Option<Vec<u8>>,
+
+    /// True when the background image is deliberately hidden by the user.
+    /// bg_image_css is preserved so toggling back re-shows without reprocessing.
+    pub(crate) bg_hidden: bool,
+    /// Reference to #bg-visibility-btn for enable/active class management.
+    bg_eye_el: Element,
 
     /// Cached visible rectangle of the processed image behind the grid, in
     /// processed-image pixel coordinates: (x0, y0, width, height).
@@ -410,7 +450,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -439,11 +479,20 @@ impl App {
             pinch_start_font_size: 16.0,
             pan_last_mid:          (0.0, 0.0),
             bg_image_url:          None,
-            bg_image_css:          None,
+            bg_disp_w:             0.0,
+            bg_disp_h:             0.0,
+            bg_pos_x:              0.0,
+            bg_pos_y:              0.0,
+            bg_drag_start:         None,
+            pinch_start_bg_disp_w: 0.0,
+            prev_tool:             None,
+            bg_move_saved:         None,
             bg_luma:               None,
             bg_luma_width:         0,
             bg_luma_height:        0,
             bg_edges:              None,
+            bg_hidden:             false,
+            bg_eye_el,
             bg_visible_rect:       (0.0, 0.0, 0.0, 0.0),
             bg_outline_mode:       BgOutlineMode::Original,
             aa_mode:               false,
@@ -999,66 +1048,95 @@ impl App {
     /// Called by set_font_size and apply_bg_image so they never overwrite each other.
     fn sync_grid_style(&self) {
         let mut style = format!("font-size: {}px", self.font_size);
-        if let Some(ref bg_css) = self.bg_image_css {
-            style.push_str("; ");
-            style.push_str(bg_css);
+        if !self.bg_hidden {
+            if let Some(ref url) = self.bg_image_url {
+                let overlay = if self.dark_mode {
+                    "rgba(13,13,13,0.5)"
+                } else {
+                    "rgba(255,255,255,0.5)"
+                };
+                style.push_str(&format!(
+                    "; background-image: linear-gradient({ov},{ov}), url({url}); \
+                     background-size: {w}px {h}px; \
+                     background-position: {x}px {y}px; \
+                     background-repeat: no-repeat",
+                    ov = overlay,
+                    url = url,
+                    w  = self.bg_disp_w.round(),
+                    h  = self.bg_disp_h.round(),
+                    x  = self.bg_pos_x.round(),
+                    y  = self.bg_pos_y.round(),
+                ));
+            }
         }
         let _ = self.grid_el.set_attribute("style", &style);
     }
 
-    /// Recompute the visible rectangle of the processed image behind the grid.
-    /// Reads client_width/height from the DOM once; call whenever the grid layout
-    /// or background image changes rather than inside per-cell painting loops.
+    /// Recompute the cell-to-processed-image transform from the current layout state.
+    ///
+    /// Stores (origin_x, origin_y, proc_cell_w, proc_cell_h) in bg_visible_rect, where
+    /// origin is the processed-image coordinate of the top-left of cell (0,0) and
+    /// proc_cell_w/h is the processed-image size of one character cell.
+    ///
+    /// Called whenever bg_pos/disp or grid layout changes — never per painted cell.
     fn refresh_visible_rect(&mut self) {
         let proc_w = self.bg_luma_width  as f64;
         let proc_h = self.bg_luma_height as f64;
-        if proc_w == 0.0 || proc_h == 0.0 {
-            self.bg_visible_rect = (0.0, 0.0, proc_w, proc_h);
+        if proc_w == 0.0 || proc_h == 0.0 || self.bg_disp_w == 0.0 || self.bg_disp_h == 0.0 {
+            self.bg_visible_rect = (0.0, 0.0, 0.0, 0.0);
             return;
         }
         let grid_w = self.grid_el.client_width()  as f64;
         let grid_h = self.grid_el.client_height() as f64;
         if grid_w == 0.0 || grid_h == 0.0 {
-            self.bg_visible_rect = (0.0, 0.0, proc_w, proc_h);
+            self.bg_visible_rect = (0.0, 0.0, 0.0, 0.0);
             return;
         }
-        let s   = (grid_w / proc_w).max(grid_h / proc_h).min(2.0);
-        let vx0 = ((proc_w - grid_w / s) / 2.0).max(0.0);
-        let vy0 = ((proc_h - grid_h / s) / 2.0).max(0.0);
-        let vw  = (grid_w / s).min(proc_w);
-        let vh  = (grid_h / s).min(proc_h);
-        self.bg_visible_rect = (vx0, vy0, vw, vh);
+        // Conversion: 1 CSS grid pixel = (proc_w / bg_disp_w) processed pixels.
+        let px_per_css_x = proc_w / self.bg_disp_w;
+        let px_per_css_y = proc_h / self.bg_disp_h;
+        // Processed-image coordinate of the top-left of cell (0, 0).
+        // bg_pos_x is where the image top-left sits in grid CSS pixels; invert it.
+        let origin_x   = -self.bg_pos_x * px_per_css_x;
+        let origin_y   = -self.bg_pos_y * px_per_css_y;
+        // Processed-image size per character cell.
+        let proc_cell_w = (grid_w / COLS as f64) * px_per_css_x;
+        let proc_cell_h = (grid_h / ROWS as f64) * px_per_css_y;
+        self.bg_visible_rect = (origin_x, origin_y, proc_cell_w, proc_cell_h);
     }
 
     /// Set the grid font size, clamped to 8–48 px, and apply it to the DOM.
     /// Called on every pinch-zoom touchmove frame.
+    /// Also scales the background image proportionally: both grid dimensions are
+    /// proportional to font_size (1ch and 1.25em both scale with it), so multiplying
+    /// all four bg layout values by new/old keeps the image visually stationary.
     pub(crate) fn set_font_size(&mut self, size: f64) {
+        let old = self.font_size;
         self.font_size = size.max(8.0).min(48.0);
+        if self.bg_image_url.is_some() && old != 0.0 {
+            let s = self.font_size / old;
+            self.bg_disp_w *= s;
+            self.bg_disp_h *= s;
+            self.bg_pos_x  *= s;
+            self.bg_pos_y  *= s;
+            // Keep the ESC-cancel snapshot in sync so cancel_bg_move restores
+            // the correct position at the current grid scale.
+            if let Some((px, py, dw, dh)) = self.bg_move_saved {
+                self.bg_move_saved = Some((px * s, py * s, dw * s, dh * s));
+            }
+        }
         self.sync_grid_style();
-        self.refresh_visible_rect(); // grid pixel dimensions change with font size
+        self.refresh_visible_rect();
     }
 
-    /// Apply a background image to #grid. The image is shown at 50% opacity by
-    /// layering an overlay gradient matching the canvas background colour.
-    /// Revokes the previous blob URL if one was active.
-    ///
-    /// `bg_size`: either "cover" or an explicit "WIDTHpx HEIGHTpx" when the image
-    /// is too small to cover at 2× magnification.
-    /// `overlay`: a CSS rgba() colour matching the active theme's canvas background
-    /// at 50% opacity, e.g. "rgba(13,13,13,0.5)" for dark theme.
-    pub(crate) fn apply_bg_image(&mut self, url: String, bg_size: String, overlay: &str) {
+    /// Store a new background image URL (revoking the old one) and update the grid style.
+    /// Display position and size come from bg_pos_x/y and bg_disp_w/h — set those
+    /// before calling this (e.g. via init_bg_layout for a fresh drop).
+    pub(crate) fn apply_bg_image(&mut self, url: String) {
         if let Some(ref old) = self.bg_image_url {
             let _ = web_sys::Url::revoke_object_url(old);
         }
-        self.bg_image_url = Some(url.clone());
-        // Two-layer background: solid colour overlay on top of image.
-        // The overlay colour is the canvas background at 50% opacity so the image
-        // reads as ghostly while drawn characters (at full opacity) stay legible.
-        self.bg_image_css = Some(format!(
-            "background-image: linear-gradient({overlay}, {overlay}), url({url}); \
-             background-size: {bg_size}; background-position: center; \
-             background-repeat: no-repeat"
-        ));
+        self.bg_image_url = Some(url);
         self.sync_grid_style();
     }
 
@@ -1137,9 +1215,11 @@ impl App {
         self.bg_luma_width  = proc_w;
         self.bg_luma_height = proc_h;
         self.bg_edges       = Some(edges);
+        self.init_bg_layout();   // cover+center before first render
         self.rebuild_background();
-        // Unlock the AA brush — catalog is built and image is now available.
+        // Unlock the AA brush and eye toggle; reset visibility to shown.
         self.enable_aa_btn();
+        self.enable_bg_eye();
     }
 
     /// Re-render the stored luma data as a background image according to the current
@@ -1227,28 +1307,204 @@ impl App {
             Err(_) => return,
         };
 
-        // Display size: cover the grid, capped at 2× natural size.
-        let (grid_w, grid_h) = document
-            .get_element_by_id("grid")
-            .map(|g| (g.client_width() as f64, g.client_height() as f64))
-            .unwrap_or((640.0, 384.0));
-        let bg_size = {
-            let cover_scale = (grid_w / proc_w as f64).max(grid_h / proc_h as f64);
-            if cover_scale <= 2.0 {
-                "cover".to_string()
-            } else {
-                format!("{}px {}px", (proc_w as f64 * 2.0).round(), (proc_h as f64 * 2.0).round())
-            }
-        };
-
-        let overlay = if self.dark_mode {
-            "rgba(13,13,13,0.5)"    // --canvas-bg dark  = #0d0d0d
-        } else {
-            "rgba(255,255,255,0.5)" // --canvas-bg light = #ffffff
-        };
-
-        self.apply_bg_image(data_url, bg_size, overlay);
+        self.apply_bg_image(data_url);
         self.refresh_visible_rect();
+    }
+
+    /// Initialise bg_disp_w/h and bg_pos_x/y to the cover+center layout.
+    /// Called on image drop before the first render. Does not call sync_grid_style.
+    fn init_bg_layout(&mut self) {
+        let proc_w = self.bg_luma_width  as f64;
+        let proc_h = self.bg_luma_height as f64;
+        let grid_w = self.grid_el.client_width()  as f64;
+        let grid_h = self.grid_el.client_height() as f64;
+        if proc_w == 0.0 || proc_h == 0.0 || grid_w == 0.0 || grid_h == 0.0 { return; }
+        let s = (grid_w / proc_w).max(grid_h / proc_h).min(2.0);
+        self.bg_disp_w = proc_w * s;
+        self.bg_disp_h = proc_h * s;
+        self.bg_pos_x  = (grid_w - self.bg_disp_w) / 2.0;
+        self.bg_pos_y  = (grid_h - self.bg_disp_h) / 2.0;
+    }
+
+    // ── BgMove tool ──────────────────────────────────────────────────────────
+
+    /// Activate BgMove mode: snapshot the current tool and layout for later restore.
+    /// The wiring caller is responsible for moving the `.active` class to the BgMove button.
+    pub(crate) fn enter_bg_move(&mut self) {
+        self.prev_tool    = Some(self.tool);
+        self.bg_move_saved = Some((self.bg_pos_x, self.bg_pos_y, self.bg_disp_w, self.bg_disp_h));
+        self.tool = Tool::BgMove;
+    }
+
+    /// Accept current position and exit BgMove mode, restoring the previous tool.
+    /// Called on second-click, Enter, or when a new image is dropped.
+    pub(crate) fn accept_bg_move(&mut self) {
+        let prev = self.prev_tool.take().unwrap_or(Tool::Pencil);
+        self.bg_move_saved = None;
+        self.tool = prev;
+        self.restore_tool_active_class(prev);
+    }
+
+    /// Cancel BgMove: revert position/scale to the snapshot taken at entry, then exit.
+    /// Called on ESC.
+    pub(crate) fn cancel_bg_move(&mut self) {
+        if let Some((px, py, dw, dh)) = self.bg_move_saved.take() {
+            self.bg_pos_x  = px;
+            self.bg_pos_y  = py;
+            self.bg_disp_w = dw;
+            self.bg_disp_h = dh;
+            self.sync_grid_style();
+            self.refresh_visible_rect();
+        }
+        let prev = self.prev_tool.take().unwrap_or(Tool::Pencil);
+        self.tool = prev;
+        self.restore_tool_active_class(prev);
+    }
+
+    /// Move the `.active` CSS class to the `[data-tool]` button matching `tool`.
+    /// Used by accept/cancel to highlight the restored tool without a wiring round-trip.
+    fn restore_tool_active_class(&self, tool: Tool) {
+        let document = match web_sys::window().and_then(|w| w.document()) {
+            Some(d) => d,
+            None    => return,
+        };
+        let attr = tool.data_attr();
+        let all  = match document.query_selector_all("[data-tool]") {
+            Ok(list) => list,
+            Err(_)   => return,
+        };
+        for i in 0..all.length() {
+            if let Some(node) = all.item(i) {
+                if let Ok(el) = node.dyn_into::<Element>() {
+                    let _ = el.class_list().remove_1("active");
+                    if el.get_attribute("data-tool").as_deref() == Some(attr) {
+                        let _ = el.class_list().add_1("active");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Begin a background image drag. Records client coordinates and current bg_pos.
+    pub(crate) fn start_bg_drag(&mut self, client_x: f64, client_y: f64) {
+        self.bg_drag_start = Some((client_x, client_y, self.bg_pos_x, self.bg_pos_y));
+    }
+
+    /// Update background position during drag. No-ops if no drag is in progress.
+    pub(crate) fn update_bg_drag(&mut self, client_x: f64, client_y: f64) {
+        let (sx, sy, px, py) = match self.bg_drag_start {
+            Some(s) => s,
+            None    => return,
+        };
+        self.bg_pos_x = px + (client_x - sx);
+        self.bg_pos_y = py + (client_y - sy);
+        self.sync_grid_style();
+        self.refresh_visible_rect();
+    }
+
+    /// End a background image drag.
+    pub(crate) fn end_bg_drag(&mut self) {
+        self.bg_drag_start = None;
+    }
+
+    /// Apply combined zoom + pan from a pinch gesture (mobile BgMove).
+    ///
+    /// `ratio` = cur_finger_dist / pinch_start_dist.
+    /// `pivot_grid_x/y` = current pinch midpoint in CSS grid-element pixels.
+    /// `pan_dx/dy` = midpoint delta since last touchmove frame (CSS pixels).
+    ///
+    /// Scale is derived from `pinch_start_bg_disp_w × ratio`, clamped to
+    /// [½ contain, 2× natural]. Zoom pivots around the midpoint, then the pan
+    /// delta is added so the content under the fingers tracks naturally.
+    pub(crate) fn update_bg_from_pinch(
+        &mut self,
+        ratio: f64,
+        pivot_grid_x: f64,
+        pivot_grid_y: f64,
+        pan_dx: f64,
+        pan_dy: f64,
+    ) {
+        if self.bg_luma_width == 0 { return; }
+        let proc_w = self.bg_luma_width  as f64;
+        let proc_h = self.bg_luma_height as f64;
+        let grid_w = self.grid_el.client_width()  as f64;
+        let grid_h = self.grid_el.client_height() as f64;
+
+        let contain_scale = (grid_w / proc_w).min(grid_h / proc_h);
+        let new_disp_w    = (self.pinch_start_bg_disp_w * ratio)
+            .clamp(proc_w * contain_scale * 0.5, proc_w * 2.0);
+        let actual_scale  = new_disp_w / self.bg_disp_w;
+        let new_disp_h    = self.bg_disp_h * actual_scale;
+
+        // Pivot zoom: keep the midpoint content stationary.
+        self.bg_pos_x  = pivot_grid_x - (pivot_grid_x - self.bg_pos_x) * actual_scale;
+        self.bg_pos_y  = pivot_grid_y - (pivot_grid_y - self.bg_pos_y) * actual_scale;
+        // Pan: shift with midpoint movement.
+        self.bg_pos_x += pan_dx;
+        self.bg_pos_y += pan_dy;
+
+        self.bg_disp_w = new_disp_w;
+        self.bg_disp_h = new_disp_h;
+
+        self.sync_grid_style();
+        self.refresh_visible_rect();
+    }
+
+    /// Zoom the background image around a CSS-grid-pixel pivot point.
+    /// `delta` is signed scroll distance — positive zooms out, negative zooms in.
+    /// Scale clamped to [half-contain, 2× natural size].
+    pub(crate) fn zoom_bg_image(&mut self, delta: f64, pivot_x: f64, pivot_y: f64) {
+        if self.bg_luma_width == 0 { return; }
+        let proc_w = self.bg_luma_width  as f64;
+        let proc_h = self.bg_luma_height as f64;
+        let grid_w = self.grid_el.client_width()  as f64;
+        let grid_h = self.grid_el.client_height() as f64;
+
+        let factor = if delta > 0.0 { 0.9 } else { 1.0 / 0.9 };
+
+        // Max = 2× natural; min = half the contain scale.
+        let contain_scale = (grid_w / proc_w).min(grid_h / proc_h);
+        let new_disp_w    = (self.bg_disp_w * factor)
+            .clamp(proc_w * contain_scale * 0.5, proc_w * 2.0);
+        let actual_scale  = new_disp_w / self.bg_disp_w;
+        let new_disp_h    = self.bg_disp_h * actual_scale;
+
+        // Keep the content under the cursor stationary as scale changes.
+        self.bg_pos_x  = pivot_x - (pivot_x - self.bg_pos_x) * actual_scale;
+        self.bg_pos_y  = pivot_y - (pivot_y - self.bg_pos_y) * actual_scale;
+        self.bg_disp_w = new_disp_w;
+        self.bg_disp_h = new_disp_h;
+
+        self.sync_grid_style();
+        self.refresh_visible_rect();
+    }
+
+    // ── Background visibility toggle ─────────────────────────────────────────
+
+    /// Toggle background visibility. Highlighted (active) = visible; un-highlighted = hidden.
+    /// Image data and edge map are preserved either way — AA brush is unaffected.
+    pub(crate) fn toggle_bg_visibility(&mut self) {
+        self.bg_hidden = !self.bg_hidden;
+        self.sync_grid_style();
+        if self.bg_hidden {
+            let _ = self.bg_eye_el.class_list().remove_1("active");
+        } else {
+            let _ = self.bg_eye_el.class_list().add_1("active");
+        }
+    }
+
+    /// Enable the eye button and show the background. Called when a new image is
+    /// successfully processed — always resets to visible so the user sees the new image.
+    /// Also exits BgMove if active (the new image resets position via init_bg_layout,
+    /// so accept_bg_move just restores prev_tool without touching position).
+    pub(crate) fn enable_bg_eye(&mut self) {
+        if self.tool == Tool::BgMove {
+            self.accept_bg_move();
+        }
+        self.bg_hidden = false;
+        let _ = self.bg_eye_el.class_list().remove_1("disabled");
+        let _ = self.bg_eye_el.class_list().add_1("active");
+        self.sync_grid_style();
     }
 
     // ── Help mode ────────────────────────────────────────────────────────────
@@ -1304,19 +1560,28 @@ impl App {
         let sw     = asciiart::SPRITE_W as usize;
         let sh     = asciiart::SPRITE_H as usize;
 
-        // Use the cached visible rectangle — recomputed by refresh_visible_rect()
-        // when the image or grid layout changes, not on every cell painted.
-        let (vis_x0, vis_y0, vis_w, vis_h) = self.bg_visible_rect;
+        // Cached transform: (origin_x, origin_y, proc_cell_w, proc_cell_h).
+        // origin = processed-image coordinate of the top-left of cell (0,0).
+        let (orig_x, orig_y, cell_w, cell_h) = self.bg_visible_rect;
+        if cell_w == 0.0 || cell_h == 0.0 { return 32u8 as char; }
 
-        // Map this cell into the visible rectangle.
-        let cell_w = vis_w / COLS as f64;
-        let cell_h = vis_h / ROWS as f64;
-        let px0 = (vis_x0 + col       as f64 * cell_w).round() as usize;
-        let py0 = (vis_y0 + row       as f64 * cell_h).round() as usize;
-        let px1 = (vis_x0 + (col + 1) as f64 * cell_w).round() as usize;
-        let py1 = (vis_y0 + (row + 1) as f64 * cell_h).round() as usize;
-        let px1 = px1.min(pw).max(px0 + 1);
-        let py1 = py1.min(ph).max(py0 + 1);
+        // Processed-image region for this cell (may be partly/fully off image).
+        let px0_f = orig_x + col       as f64 * cell_w;
+        let py0_f = orig_y + row       as f64 * cell_h;
+        let px1_f = orig_x + (col + 1) as f64 * cell_w;
+        let py1_f = orig_y + (row + 1) as f64 * cell_h;
+
+        // Cell doesn't overlap the processed image — return space.
+        if px1_f <= 0.0 || py1_f <= 0.0 || px0_f >= proc_w || py0_f >= proc_h {
+            return 32u8 as char;
+        }
+
+        let px0 = px0_f.max(0.0).round() as usize;
+        let py0 = py0_f.max(0.0).round() as usize;
+        let px1 = px1_f.min(proc_w).round() as usize;
+        let py1 = py1_f.min(proc_h).round() as usize;
+        let px1 = px1.max(px0 + 1).min(pw);
+        let py1 = py1.max(py0 + 1).min(ph);
 
         // Box-average downsample the cell region to SPRITE_W × SPRITE_H.
         let mut patch = vec![0u8; sw * sh];
@@ -1338,7 +1603,13 @@ impl App {
             }
         }
 
-        let idx = asciiart::best_sprite_match(&patch, &self.sprite_catalog);
+        // If any patch pixel exceeds the threshold, a strong edge is present and
+        // space must not be chosen — start the search at index 1 to exclude it.
+        // Weak/mushy cells stay at 0 so space can win through normal SSD matching.
+        let patch_max = patch.iter().cloned().max().unwrap_or(0);
+        let min_idx   = if patch_max >= asciiart::AA_EDGE_THRESHOLD { 1 } else { 0 };
+
+        let idx = asciiart::best_sprite_match(&patch, &self.sprite_catalog, min_idx);
         (idx as u8 + 32) as char
     }
 
@@ -1888,7 +2159,10 @@ pub fn start() {
     let aa_btn_el = document
         .get_element_by_id("aa-mode-btn")
         .expect("#aa-mode-btn must exist in HTML");
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el)));
+    let bg_eye_el = document
+        .get_element_by_id("bg-visibility-btn")
+        .expect("#bg-visibility-btn must exist in HTML");
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el)));
 
     // Build the sprite catalog (95 printable ASCII chars → grayscale bitmaps).
     // Done after App is constructed so the canvas API is ready.
@@ -1921,4 +2195,7 @@ pub fn start() {
     wire_drag_drop(&document, &app);
     wire_outline_mode(&document, &app);
     wire_aa_mode(&document, &app);
+    wire_bg_visibility(&document, &app);
+    wire_bg_move_tool(&document, &app);
+    wire_load_image(&document, &app);
 }

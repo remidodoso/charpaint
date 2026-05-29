@@ -1461,9 +1461,36 @@ fn aa_mode_tap(app: &Rc<RefCell<App>>, btn: &Element) {
     a.aa_mode = !a.aa_mode;
     if a.aa_mode {
         btn.class_list().add_1("active").unwrap();
+        a.enable_aa_charset_btn();
     } else {
         btn.class_list().remove_1("active").unwrap();
+        a.disable_aa_charset_btn();
     }
+}
+
+/// Wire `#aa-charset-btn` — cycles the AA character set when AA mode is active.
+///
+/// The button is disabled while AA mode is off (handled by aa_mode_tap).
+/// When clicked while enabled, cycles Ascii7 → Braille → Ascii7, updates the
+/// button icon, and flashes briefly to confirm the action.
+pub fn wire_aa_charset(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("aa-charset-btn") {
+        Some(el) => el,
+        None => return,
+    };
+    let app      = Rc::clone(app);
+    let btn_clone = btn.clone();
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        let new_charset = {
+            let mut a = app.borrow_mut();
+            a.aa_charset = a.aa_charset.cycle();
+            a.aa_charset
+        };
+        btn_clone.set_text_content(Some(new_charset.icon()));
+        flash_button(&btn_clone);
+    });
+    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+    cb.forget();
 }
 
 /// Shared action for touch and mouse outline-mode taps.
@@ -1611,6 +1638,91 @@ fn bg_move_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) 
             t.class_list().remove_1("active").unwrap();
         }
         btn.class_list().add_1("active").unwrap();
+    }
+}
+
+/// Wire the image controls strip: ◀/▶ contrast buttons and the hide checkbox.
+///
+/// The strip is shown/hidden by App::enter_bg_move / accept/cancel_bg_move.
+/// This function only attaches the per-control event handlers.
+pub fn wire_image_controls(document: &Document, app: &Rc<RefCell<App>>) {
+    // ◀ Less texture sharpening
+    if let Some(btn) = document.get_element_by_id("texture-dec") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().adjust_texture(-1);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // ▶ More texture sharpening
+    if let Some(btn) = document.get_element_by_id("texture-inc") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().adjust_texture(1);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // Click on "Texture" label — reset to zero
+    if let Some(el) = document.get_element_by_id("texture-label") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().reset_texture();
+        });
+        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // ◀ Less pop sharpening
+    if let Some(btn) = document.get_element_by_id("pop-dec") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().adjust_pop(-1);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // ▶ More pop sharpening
+    if let Some(btn) = document.get_element_by_id("pop-inc") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().adjust_pop(1);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // Click on "Pop" label — reset to zero
+    if let Some(el) = document.get_element_by_id("pop-label") {
+        let app = Rc::clone(app);
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            app.borrow_mut().reset_pop();
+        });
+        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // Hide checkbox — checked hides the strip; unchecked shows it again.
+    if let Some(el) = document.get_element_by_id("image-controls-hide") {
+        let app = Rc::clone(app);
+        let el_clone = el.clone();
+        let cb = Closure::<dyn FnMut(Event)>::new(move |_e: Event| {
+            let checked = el_clone
+                .dyn_ref::<web_sys::HtmlInputElement>()
+                .map(|i| i.checked())
+                .unwrap_or(false);
+            if checked {
+                app.borrow().hide_image_controls();
+            } else {
+                app.borrow().show_image_controls();
+            }
+        });
+        el.add_event_listener_with_callback("change", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
     }
 }
 

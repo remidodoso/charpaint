@@ -118,6 +118,91 @@ pub fn stretch_luminance(luma: &mut [u8]) {
     }
 }
 
+/// Horizontal box blur using a prefix sum — O(W) per row regardless of radius.
+/// Output is f32 to preserve precision across the two-pass separable blur.
+fn box_blur_h(src: &[u8], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut dst = vec![0f32; w * h];
+    for y in 0..h {
+        let mut prefix = vec![0u32; w + 1];
+        for x in 0..w { prefix[x + 1] = prefix[x] + src[y * w + x] as u32; }
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            dst[y * w + x] = (prefix[hi] - prefix[lo]) as f32 / (hi - lo) as f32;
+        }
+    }
+    dst
+}
+
+/// Horizontal box blur on f32 data — same logic as box_blur_h but accepts f32 input
+/// so it can be chained after a first blur pass without converting back to u8.
+fn box_blur_hf(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut dst = vec![0f32; w * h];
+    for y in 0..h {
+        let mut prefix = vec![0f32; w + 1];
+        for x in 0..w { prefix[x + 1] = prefix[x] + src[y * w + x]; }
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            dst[y * w + x] = (prefix[hi] - prefix[lo]) / (hi - lo) as f32;
+        }
+    }
+    dst
+}
+
+/// Vertical box blur using a prefix sum — O(H) per column regardless of radius.
+fn box_blur_v(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut dst = vec![0f32; w * h];
+    for x in 0..w {
+        let mut prefix = vec![0f32; h + 1];
+        for y in 0..h { prefix[y + 1] = prefix[y] + src[y * w + x]; }
+        for y in 0..h {
+            let lo = y.saturating_sub(r);
+            let hi = (y + r + 1).min(h);
+            dst[y * w + x] = (prefix[hi] - prefix[lo]) / (hi - lo) as f32;
+        }
+    }
+    dst
+}
+
+/// Apply texture sharpening via unsharp mask: output = clamp(input + factor*(input-blur), 0, 255).
+///
+/// Uses a single separable box blur at a fixed radius (~10px ≈ 3pt at PROCESSING_HEIGHT 1024).
+/// `amount_step` 0 returns a plain clone — no blur is computed.
+/// Each step above 0 adds 0.5 to the USM factor (steps 1–5 → factors 0.5–2.5).
+pub fn apply_texture(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
+    if amount_step == 0 { return luma.to_vec(); }
+    let factor         = amount_step as f32 * 0.5;
+    const RADIUS: usize = 10; // ≈ 3pt at PROCESSING_HEIGHT 1024
+    let blurred = box_blur_v(&box_blur_h(luma, w as usize, h as usize, RADIUS), w as usize, h as usize, RADIUS);
+    luma.iter().zip(blurred.iter())
+        .map(|(&orig, &blur)| {
+            (orig as f32 + factor * (orig as f32 - blur)).max(0.0).min(255.0).round() as u8
+        })
+        .collect()
+}
+
+/// Apply pop (large-radius) sharpening via unsharp mask.
+///
+/// Uses two separable box blur passes at a fixed radius (~45px ≈ one canvas cell at
+/// PROCESSING_HEIGHT 1024). Two passes approximate a triangular kernel, giving smoother
+/// halos at large radius than a single pass. `amount_step` 0 is a no-op clone.
+pub fn apply_pop(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
+    if amount_step == 0 { return luma.to_vec(); }
+    let factor         = amount_step as f32 * 0.5;
+    const RADIUS: usize = 45; // ≈ one canvas cell at PROCESSING_HEIGHT 1024
+    let wu = w as usize;
+    let hu = h as usize;
+    // Two-pass separable box blur.
+    let pass1   = box_blur_v(&box_blur_h(luma, wu, hu, RADIUS), wu, hu, RADIUS);
+    let blurred = box_blur_v(&box_blur_hf(&pass1, wu, hu, RADIUS), wu, hu, RADIUS);
+    luma.iter().zip(blurred.iter())
+        .map(|(&orig, &blur)| {
+            (orig as f32 + factor * (orig as f32 - blur)).max(0.0).min(255.0).round() as u8
+        })
+        .collect()
+}
+
 /// Minimum patch-max value (0–255) for the "must place a non-space character" rule.
 /// If the maximum pixel value in the downsampled edge patch meets or exceeds this
 /// threshold, space (catalog index 0) is excluded from the SSD search. Cells below

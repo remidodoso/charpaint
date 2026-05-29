@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0528:1552 -->
+<!-- build: 0528:2313 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -58,24 +58,24 @@
     #menubar {
       background: var(--chrome);
       border-bottom: 1px solid var(--border);
-      padding: 4px 10px;
+      padding: 6px 15px;
       display: flex;
       align-items: center;
-      gap: 4px;
-      font-size: 13px;
+      gap: 6px;
+      font-size: 20px;
       user-select: none;
       flex-shrink: 0;
     }
     #menubar .brand {
       font-weight: bold;
       color: var(--accent);
-      padding: 2px 8px 2px 0;
-      margin-right: 4px;
+      padding: 3px 12px 3px 0;
+      margin-right: 6px;
       border-right: 1px solid var(--border);
     }
     #menubar .menu-item {
       cursor: pointer;
-      padding: 2px 8px;
+      padding: 3px 12px;
       border-radius: 3px;
     }
     #menubar .menu-item:hover { background: var(--border); }
@@ -84,12 +84,12 @@
     /* Undo / redo action buttons — styled as plain icon buttons, not text labels */
     #menubar .menu-action {
       cursor: pointer;
-      padding: 2px 7px;
+      padding: 3px 11px;
       border-radius: 3px;
       border: none;
       background: transparent;
       color: var(--text);
-      font-size: 15px;
+      font-size: 23px;
       line-height: 1.5;
     }
     #menubar .menu-action:hover { background: var(--border); }
@@ -110,59 +110,108 @@
     /* Thin vertical rule separating undo/redo from the File menu group */
     #menubar .menu-sep {
       width: 1px;
-      height: 16px;
+      height: 24px;
       background: var(--border);
-      margin: 0 4px;
+      margin: 0 6px;
       flex-shrink: 0;
     }
 
     /* Theme toggle — label text ("☀ Light" / "☾ Dark") is set by Rust */
     #theme-toggle {
       cursor: pointer;
-      padding: 2px 10px;
+      padding: 3px 15px;
       border-radius: 3px;
       border: 1px solid var(--border);
       background: transparent;
       color: var(--text);
-      font-size: 12px;
+      font-size: 18px;
       line-height: 1.6;
     }
     #theme-toggle:hover { background: var(--border); }
 
-    /* ── Main area (toolbar + canvas) ────────────────────────────────────── */
-    #main {
-      display: flex;
-      flex: 1;
-      overflow: hidden;
+    /* ── Image controls strip ────────────────────────────────────────────── */
+    /* Appears between toolbar and canvas when BgMove is active.             */
+    /* Rust shows it via style="display: flex" and hides via "display: none" */
+    #image-controls {
+      display: none;
+      background: var(--chrome);
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+      padding: 5px 14px;
+      gap: 8px;
+      flex-shrink: 0;
+      font-size: 13px;
+      user-select: none;
     }
+    .img-ctrl-label {
+      color: var(--text-dim);
+      min-width: 60px;
+      text-align: center;
+    }
+    .img-ctrl-btn {
+      cursor: pointer;
+      padding: 2px 9px;
+      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .img-ctrl-btn:hover { background: var(--border); }
+    .img-ctrl-btn.disabled {
+      opacity: 0.3;
+      pointer-events: none;
+      cursor: default;
+    }
+    /* Clickable label — tapping resets the control to zero */
+    #texture-label, #pop-label { cursor: pointer; }
+    #texture-label:hover, #pop-label:hover { color: var(--text); }
+    .img-ctrl-sep {
+      width: 1px;
+      height: 16px;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+    /* Spacer pushes the hide checkbox to the far right */
+    #image-controls .spacer { flex: 1; }
+    .img-ctrl-hide {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      cursor: pointer;
+      color: var(--text-dim);
+      font-size: 13px;
+    }
+    .img-ctrl-hide input { cursor: pointer; }
 
     /* ── Toolbar ──────────────────────────────────────────────────────────── */
-    /* Static structure defined in HTML; click handlers wired by Rust.        */
+    /* Horizontal strip below the menu bar. tool-rows become vertical pairs    */
+    /* (each pair stacks top/bottom), the toolbar flows them left-to-right.   */
     #toolbar {
       background: var(--chrome);
-      border-right: 1px solid var(--border);
-      width: 56px;
+      border-bottom: 1px solid var(--border);
       display: flex;
-      flex-direction: column;
+      flex-direction: row;
       align-items: center;
-      padding: 8px 0;
-      gap: 2px;
+      padding: 6px 12px;
+      gap: 6px;
       flex-shrink: 0;
       user-select: none;
-      position: relative;
+      overflow-x: auto;
     }
-    .tool-row { display: flex; gap: 2px; }
+    .tool-row { display: flex; flex-direction: column; gap: 3px; }
 
     /* Individual tool button */
     .tool {
-      width: 24px;
-      height: 24px;
+      width: 36px;
+      height: 36px;
       display: flex;
       align-items: center;
       justify-content: center;
-      border-radius: 3px;
+      border-radius: 4px;
       cursor: pointer;
-      font-size: 14px;
+      font-size: 21px;
       border: 1px solid transparent;
       color: var(--text);
     }
@@ -173,18 +222,19 @@
       border-color: var(--accent);
     }
 
-    /* Horizontal divider between tool groups */
+    /* Vertical divider between tool groups in the horizontal toolbar */
     .tool-sep {
-      width: 40px;
-      height: 1px;
+      width: 1px;
+      height: 60px;
       background: var(--border);
-      margin: 4px 0;
+      margin: 0 4px;
+      flex-shrink: 0;
     }
 
     /* Empty placeholder slot — visual sibling to the mode button, non-interactive */
     .tool-empty {
-      width: 24px;
-      height: 24px;
+      width: 36px;
+      height: 36px;
       border-radius: 3px;
       border: 1px dashed var(--border);
       opacity: 0.25;
@@ -256,35 +306,34 @@
     #palette {
       background: var(--chrome);
       border-top: 1px solid var(--border);
-      height: 52px;
       display: flex;
       align-items: center;
-      padding: 0 10px;
-      gap: 4px;
+      padding: 6px 14px;
+      gap: 6px;
       flex-shrink: 0;
       user-select: none;
       overflow-x: auto;
     }
     .palette-label {
-      font-size: 11px;
+      font-size: 16px;
       color: var(--text-dim);
-      margin-right: 4px;
+      margin-right: 6px;
       white-space: nowrap;
     }
 
     /* Individual palette character button */
     .pal-char {
-      width: 30px;
-      height: 34px;
+      width: 45px;
+      height: 51px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-family: monospace;
-      font-size: 16px;
+      font-size: 24px;
       background: var(--canvas-bg);
       color: var(--canvas-fg);
       border: 1px solid var(--border);
-      border-radius: 3px;
+      border-radius: 4px;
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -303,7 +352,7 @@
     /* Visual separator between palette groups */
     .pal-sep {
       width: 1px;
-      height: 34px;
+      height: 51px;
       background: var(--border);
       margin: 0 4px;
       flex-shrink: 0;
@@ -344,12 +393,12 @@
       position: relative;
       z-index: 101;
       cursor: pointer;
-      padding: 2px 8px;
+      padding: 3px 12px;
       border-radius: 3px;
       border: 1px solid var(--border);
       background: transparent;
       color: var(--text);
-      font-size: 13px;
+      font-size: 20px;
       font-weight: bold;
       line-height: 1.6;
     }
@@ -376,12 +425,12 @@
     }
 
     /* Floating balloon in the top-left of the canvas area.                      */
-    /* top/left approximate: menubar height (~36px) + gap, toolbar (56px) +      */
-    /* canvas padding (16px). Known approximation — revisit if layout changes.   */
+    /* top/left approximate: menubar height (~54px) + gap. Known approximation   */
+    /* — revisit if layout changes.                                              */
     #help-popup {
       display: none;
       position: fixed;
-      top: 44px;
+      top: 60px;
       left: 80px;
       z-index: 102;
       max-width: 300px;
@@ -423,17 +472,13 @@
     <button id="btn-redo"  class="menu-action" title="Redo (Shift+Ctrl+Z)"         data-help="redo">↪</button>
     <button id="btn-copy"  class="menu-action" title="Copy canvas to clipboard"    data-help="copy">⧉</button>
     <button id="btn-clear" class="menu-action" title="Clear canvas (or selection)" data-help="clear">⌧</button>
-    <span class="menu-sep"></span>
-    <span class="menu-item">Goodies</span>
     <span class="spacer"></span>
     <!-- Initial label "☀ Light" reflects current dark default; Rust toggles it -->
     <button id="theme-toggle" data-help="theme">☀ Light</button>
   </div>
 
-  <div id="main">
-
-    <!-- Toolbar — icons and data-tool attrs defined here; click handlers wired by Rust -->
-    <div id="toolbar">
+  <!-- Toolbar — icons and data-tool attrs defined here; click handlers wired by Rust -->
+  <div id="toolbar">
       <!-- Blend mode tile: shows current mode icon; mousedown+drag opens the fly-out (wired by Rust) -->
       <!-- #mode-dropdown is appended here by build_blend_mode_control() -->
       <div class="tool-row">
@@ -485,15 +530,29 @@
              title="Load background image from file"
              data-help="load-image">🖼</div>
       </div>
-    </div>
+  </div>
 
-    <div id="canvas-wrap">
+  <!-- Image controls — shown by Rust when BgMove tool is active; hidden otherwise.
+       Arrows adjust; clicking the label resets to zero. -->
+  <div id="image-controls">
+    <button id="texture-dec" class="img-ctrl-btn disabled" title="Less texture sharpening">◀</button>
+    <span class="img-ctrl-label" id="texture-label" title="Click to reset">Texture</span>
+    <button id="texture-inc" class="img-ctrl-btn" title="More texture sharpening">▶</button>
+    <span class="img-ctrl-sep"></span>
+    <button id="pop-dec" class="img-ctrl-btn disabled" title="Less pop sharpening">◀</button>
+    <span class="img-ctrl-label" id="pop-label" title="Click to reset">Pop</span>
+    <button id="pop-inc" class="img-ctrl-btn" title="More pop sharpening">▶</button>
+    <span class="spacer"></span>
+    <label class="img-ctrl-hide">
+      <input type="checkbox" id="image-controls-hide"> Hide
+    </label>
+  </div>
+
+  <div id="canvas-wrap">
       <!-- Grid cells are created programmatically by Rust (build_grid) -->
       <div id="grid"></div>
       <!-- Build timestamp set by Rust at startup via env!("BUILD_TIMESTAMP") -->
       <div id="build-info"></div>
-    </div>
-
   </div>
 
   <!-- Palette entries are created programmatically by Rust (build_palette) -->
@@ -506,6 +565,10 @@
     <div id="aa-mode-btn" class="pal-char disabled"
          title="AA brush — paint characters matched to background image (drop an image first)"
          data-help="aa-mode">🎨︎</div>
+    <!-- Charset mode — dimmed while AA is off; cycles Ascii7 ↔ Braille when AA is on -->
+    <div id="aa-charset-btn" class="pal-char disabled"
+         title="AA charset: ASCII — click to cycle"
+         data-help="aa-charset">a</div>
     <div class="pal-sep"></div>
   </div>
 

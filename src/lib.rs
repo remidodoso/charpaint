@@ -14,9 +14,10 @@ mod util;
 use util::bresenham;
 
 mod asciiart;
+mod dom_setup;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode, wire_bg_visibility, wire_bg_move_tool, wire_load_image};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode, wire_aa_charset, wire_bg_visibility, wire_bg_move_tool, wire_load_image, wire_image_controls};
 
 // Help strings generated from locales/help.en.yaml by build.rs.
 include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
@@ -25,6 +26,11 @@ include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
 
 const COLS: usize = 80;
 const ROWS: usize = 24;
+
+/// Maximum texture sharpening step. Steps 1–MAX each add 0.5× USM factor (so MAX=5 → up to 2.5×).
+const MAX_TEXTURE: u32 = 5;
+/// Maximum pop sharpening step. Same scale as MAX_TEXTURE.
+const MAX_POP: u32 = 5;
 
 /// The character placed in a cell when it is blank / erased.
 const BLANK: char = ' ';
@@ -170,6 +176,43 @@ impl BgOutlineMode {
             BgOutlineMode::Original     => BgOutlineMode::WhiteOnBlack,
             BgOutlineMode::WhiteOnBlack => BgOutlineMode::BlackOnWhite,
             BgOutlineMode::BlackOnWhite => BgOutlineMode::Original,
+        }
+    }
+}
+
+// ── AaCharset ────────────────────────────────────────────────────────────────
+
+/// Which character set the AA brush draws from.
+/// Each variant has its own sprite catalog built at startup.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum AaCharset {
+    Ascii7,  // printable ASCII 32–126 (95 chars) — default
+    Braille, // Unicode braille 0x2800–0x28FF (256 chars, 6-dot + 8-dot combined)
+}
+
+impl AaCharset {
+    /// Icon shown in the charset-mode button.
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            AaCharset::Ascii7  => "a",
+            AaCharset::Braille => "⠵", // braille 'z' — evokes the Game of Life glider
+        }
+    }
+
+    /// Cycle through available charsets.
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            AaCharset::Ascii7  => AaCharset::Braille,
+            AaCharset::Braille => AaCharset::Ascii7,
+        }
+    }
+
+    /// Map a catalog index back to the character it represents.
+    pub(crate) fn char_from_idx(&self, idx: usize) -> char {
+        match self {
+            AaCharset::Ascii7  => (idx as u8 + 32) as char,
+            // All code points in U+2800–U+28FF are valid Unicode; unwrap_or is defensive only.
+            AaCharset::Braille => char::from_u32(0x2800 + idx as u32).unwrap_or('\u{2800}'),
         }
     }
 }
@@ -392,12 +435,24 @@ pub(crate) struct App {
     /// Background layout snapshot taken when BgMove was entered. Restored on ESC.
     bg_move_saved: Option<(f64, f64, f64, f64)>,
 
-    /// Full-resolution luminance data extracted from the dropped image and
-    /// range-stretched by the AA pipeline. Indexed [row * bg_luma_width + col].
+    /// Raw luminance after to_luminance + stretch_luminance, before contrast adjustment.
+    /// Stored so rebuild_from_params can re-derive bg_luma without reloading the image.
     /// None until an image has been dropped and processed.
+    pub(crate) bg_luma_raw: Option<Vec<u8>>,
+
+    /// Contrast-adjusted luminance derived from bg_luma_raw.
+    /// Recomputed by rebuild_from_params whenever contrast_index changes.
+    /// None until first rebuild_from_params call after image load.
     pub(crate) bg_luma:        Option<Vec<u8>>,
     pub(crate) bg_luma_width:  u32,
     pub(crate) bg_luma_height: u32,
+
+    /// Texture sharpening step in [0, MAX_TEXTURE]; 0 = no sharpening.
+    /// Applied to bg_luma_raw via unsharp mask to produce bg_luma before edge detection.
+    pub(crate) texture_amount: u32,
+    /// Pop (large-radius) sharpening step in [0, MAX_POP]; 0 = no sharpening.
+    /// Applied after texture sharpening in rebuild_from_params.
+    pub(crate) pop_amount: u32,
 
     /// Sobel + enhance edge map derived from bg_luma at the same dimensions.
     /// Used by compute_best_char: edge features (bright = present) are matched
@@ -430,15 +485,32 @@ pub(crate) struct App {
     /// Reference to #aa-mode-btn for enable/disable when the background changes.
     /// Stored here so process_bg_image and future clear-image code can update it.
     aa_btn_el: Element,
-    /// Pre-rendered grayscale bitmaps for printable ASCII chars 32–126 (95 entries).
-    /// Indexed as (char_code − 32). Each entry is SPRITE_W × SPRITE_H bytes.
-    /// Built once at startup; empty vec means catalog unavailable (AA mode no-ops).
-    pub(crate) sprite_catalog: Vec<Vec<u8>>,
+    /// Active AA charset — selects which catalog compute_best_char searches.
+    pub(crate) aa_charset: AaCharset,
+    /// Sprite catalog for printable ASCII 32–126.  Empty until built at startup.
+    pub(crate) catalog_ascii7: Vec<Vec<u8>>,
+    /// Sprite catalog for Unicode braille U+2800–U+28FF. Empty until built at startup.
+    pub(crate) catalog_braille: Vec<Vec<u8>>,
+    /// Reference to #aa-charset-btn for enable/disable in sync with aa_mode.
+    aa_charset_btn_el: Element,
 
     /// True while the help-mode overlay is active.
     /// When on, pointer events are captured by #help-overlay and routed to
     /// the help popup instead of the canvas/toolbar.
     pub(crate) help_mode: bool,
+
+    /// Reference to #image-controls strip — shown by Rust when BgMove is active.
+    image_controls_el: Element,
+    /// Reference to #image-controls-hide checkbox — unchecked each time the strip is shown
+    /// so it always starts fresh when BgMove is re-entered.
+    image_controls_hide_el: web_sys::HtmlInputElement,
+    /// ◀ / ▶ buttons for texture sharpening — kept here so sync_texture_buttons can
+    /// add/remove the `disabled` class without a document lookup on every change.
+    texture_dec_el: Element,
+    texture_inc_el: Element,
+    /// ◀ / ▶ buttons for pop sharpening.
+    pop_dec_el: Element,
+    pop_inc_el: Element,
 
     // ── Touch / pinch-zoom state ─────────────────────────────────────────────
     grid_el:                          Element,      // #grid element — target for font-size changes
@@ -450,7 +522,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element, aa_charset_btn_el: Element, image_controls_el: Element, image_controls_hide_el: web_sys::HtmlInputElement, texture_dec_el: Element, texture_inc_el: Element, pop_dec_el: Element, pop_inc_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -487,9 +559,12 @@ impl App {
             pinch_start_bg_disp_w: 0.0,
             prev_tool:             None,
             bg_move_saved:         None,
+            bg_luma_raw:           None,
             bg_luma:               None,
             bg_luma_width:         0,
             bg_luma_height:        0,
+            texture_amount:        0,
+            pop_amount:            0,
             bg_edges:              None,
             bg_hidden:             false,
             bg_eye_el,
@@ -497,8 +572,17 @@ impl App {
             bg_outline_mode:       BgOutlineMode::Original,
             aa_mode:               false,
             aa_btn_el,
-            sprite_catalog:        Vec::new(),
+            aa_charset:            AaCharset::Ascii7,
+            catalog_ascii7:        Vec::new(),
+            catalog_braille:       Vec::new(),
+            aa_charset_btn_el,
             help_mode:             false,
+            image_controls_el,
+            image_controls_hide_el,
+            texture_dec_el,
+            texture_inc_el,
+            pop_dec_el,
+            pop_inc_el,
         }
     }
 
@@ -647,7 +731,7 @@ impl App {
                     let overall_dr = (row as i32) - (sr as i32);
                     for (i, &(c, r)) in cells.iter().enumerate() {
                         // AA mode overrides line mode — use image-matched char per cell.
-                        let ch = if self.aa_mode && self.bg_edges.is_some() && !self.sprite_catalog.is_empty() {
+                        let ch = if self.aa_mode && self.bg_edges.is_some() && !self.active_catalog().is_empty() {
                             self.compute_best_char(c, r)
                         } else {
                             match self.line_mode {
@@ -1206,17 +1290,14 @@ impl App {
         let mut luma = asciiart::to_luminance(&rgba);
         asciiart::stretch_luminance(&mut luma);
 
-        // Pre-compute the edge map for AA sprite matching while luma is still owned.
-        // Edges are stored separately from luma so rebuild_background can use either.
-        let mut edges = asciiart::sobel_edges(&luma, proc_w, proc_h);
-        asciiart::enhance_edges(&mut edges);
-
-        self.bg_luma        = Some(luma);
+        // Store the stretched-but-unadjusted luma so contrast can be re-applied
+        // later without reloading the image. rebuild_from_params derives bg_luma
+        // and bg_edges from this raw copy whenever a parameter changes.
+        self.bg_luma_raw    = Some(luma);
         self.bg_luma_width  = proc_w;
         self.bg_luma_height = proc_h;
-        self.bg_edges       = Some(edges);
         self.init_bg_layout();   // cover+center before first render
-        self.rebuild_background();
+        self.rebuild_from_params(); // sets bg_luma, bg_edges, calls rebuild_background
         // Unlock the AA brush and eye toggle; reset visibility to shown.
         self.enable_aa_btn();
         self.enable_bg_eye();
@@ -1237,6 +1318,8 @@ impl App {
             let h = self.bg_luma_height;
             if w == 0 || h == 0 { return; }
 
+            // For edge modes: use stored bg_edges rather than re-running Sobel.
+            // bg_edges and bg_luma are separate fields; Rust NLL allows both borrows.
             let pixels = match self.bg_outline_mode {
                 BgOutlineMode::Original => {
                     // Straight grayscale: R=G=B=L, A=255.
@@ -1247,9 +1330,11 @@ impl App {
                     v
                 }
                 BgOutlineMode::WhiteOnBlack => {
-                    // Edge magnitude map — bright where edges are, dark elsewhere.
-                    let mut edges = asciiart::sobel_edges(luma, w, h);
-                    asciiart::enhance_edges(&mut edges);
+                    // Use cached edges; recompute only if missing (defensive fallback).
+                    let edges: Vec<u8> = match self.bg_edges.as_ref() {
+                        Some(e) => e.clone(),
+                        None    => { let mut e = asciiart::sobel_edges(luma, w, h); asciiart::enhance_edges(&mut e); e }
+                    };
                     let mut v = vec![0u8; edges.len() * 4];
                     for (i, &e) in edges.iter().enumerate() {
                         v[i*4] = e; v[i*4+1] = e; v[i*4+2] = e; v[i*4+3] = 255;
@@ -1257,9 +1342,11 @@ impl App {
                     v
                 }
                 BgOutlineMode::BlackOnWhite => {
-                    // Inverted edge map — enhance first, then invert so edges are dark on white.
-                    let mut edges = asciiart::sobel_edges(luma, w, h);
-                    asciiart::enhance_edges(&mut edges);
+                    // Inverted cached edges.
+                    let edges: Vec<u8> = match self.bg_edges.as_ref() {
+                        Some(e) => e.clone(),
+                        None    => { let mut e = asciiart::sobel_edges(luma, w, h); asciiart::enhance_edges(&mut e); e }
+                    };
                     let mut v = vec![0u8; edges.len() * 4];
                     for (i, &e) in edges.iter().enumerate() {
                         let inv = 255u8.saturating_sub(e);
@@ -1302,7 +1389,9 @@ impl App {
             Err(_) => return,
         };
         if ctx.put_image_data(&image_data, 0.0, 0.0).is_err() { return; }
-        let data_url = match canvas.to_data_url() {
+        // JPEG encodes 5-10x faster than PNG for a same-size image — acceptable
+        // quality loss for a tracing reference that is never saved or exported.
+        let data_url = match canvas.to_data_url_with_type("image/jpeg") {
             Ok(u)  => u,
             Err(_) => return,
         };
@@ -1334,6 +1423,7 @@ impl App {
         self.prev_tool    = Some(self.tool);
         self.bg_move_saved = Some((self.bg_pos_x, self.bg_pos_y, self.bg_disp_w, self.bg_disp_h));
         self.tool = Tool::BgMove;
+        self.show_image_controls(); // always show fresh (resets dismiss checkbox)
     }
 
     /// Accept current position and exit BgMove mode, restoring the previous tool.
@@ -1343,6 +1433,7 @@ impl App {
         self.bg_move_saved = None;
         self.tool = prev;
         self.restore_tool_active_class(prev);
+        self.hide_image_controls();
     }
 
     /// Cancel BgMove: revert position/scale to the snapshot taken at entry, then exit.
@@ -1359,6 +1450,7 @@ impl App {
         let prev = self.prev_tool.take().unwrap_or(Tool::Pencil);
         self.tool = prev;
         self.restore_tool_active_class(prev);
+        self.hide_image_controls();
     }
 
     /// Move the `.active` CSS class to the `[data-tool]` button matching `tool`.
@@ -1516,7 +1608,122 @@ impl App {
         self.help_mode
     }
 
+    // ── Image controls strip ────────────────────────────────────────────────
+
+    /// Show the image controls strip and reset the hide checkbox to unchecked.
+    /// Called each time BgMove is entered so the strip always appears fresh.
+    pub(crate) fn show_image_controls(&self) {
+        let _ = self.image_controls_el.set_attribute("style", "display: flex");
+        self.image_controls_hide_el.set_checked(false);
+    }
+
+    /// Hide the image controls strip. Called on BgMove exit or when the hide checkbox fires.
+    pub(crate) fn hide_image_controls(&self) {
+        let _ = self.image_controls_el.set_attribute("style", "display: none");
+    }
+
+    /// Apply current contrast_index to bg_luma_raw, recompute edges, and rebuild the background.
+    /// No-ops when no image has been loaded yet.
+    pub(crate) fn rebuild_from_params(&mut self) {
+        let w = self.bg_luma_width;
+        let h = self.bg_luma_height;
+        if w == 0 || h == 0 { return; }
+        let luma = match self.bg_luma_raw.as_ref() {
+            Some(raw) => {
+                let after_texture = asciiart::apply_texture(raw, w, h, self.texture_amount);
+                asciiart::apply_pop(&after_texture, w, h, self.pop_amount)
+            }
+            None => return,
+        };
+        let mut edges = asciiart::sobel_edges(&luma, w, h);
+        asciiart::enhance_edges(&mut edges);
+        self.bg_luma  = Some(luma);
+        self.bg_edges = Some(edges);
+        self.rebuild_background();
+    }
+
+    /// Add delta to texture_amount (clamped to [0, MAX_TEXTURE]) and rebuild.
+    /// No-ops silently if already at the limit in that direction.
+    pub(crate) fn adjust_texture(&mut self, delta: i32) {
+        let new_val = (self.texture_amount as i32 + delta).clamp(0, MAX_TEXTURE as i32) as u32;
+        if new_val == self.texture_amount { return; }
+        self.texture_amount = new_val;
+        self.sync_texture_buttons();
+        self.rebuild_from_params();
+    }
+
+    /// Reset texture sharpening to zero and rebuild.
+    pub(crate) fn reset_texture(&mut self) {
+        if self.texture_amount == 0 { return; }
+        self.texture_amount = 0;
+        self.sync_texture_buttons();
+        self.rebuild_from_params();
+    }
+
+    /// Sync disabled class on the ◀/▶ texture buttons to reflect the current amount.
+    fn sync_texture_buttons(&self) {
+        if self.texture_amount == 0 {
+            let _ = self.texture_dec_el.class_list().add_1("disabled");
+        } else {
+            let _ = self.texture_dec_el.class_list().remove_1("disabled");
+        }
+        if self.texture_amount >= MAX_TEXTURE {
+            let _ = self.texture_inc_el.class_list().add_1("disabled");
+        } else {
+            let _ = self.texture_inc_el.class_list().remove_1("disabled");
+        }
+    }
+
+    /// Add delta to pop_amount (clamped to [0, MAX_POP]) and rebuild.
+    pub(crate) fn adjust_pop(&mut self, delta: i32) {
+        let new_val = (self.pop_amount as i32 + delta).clamp(0, MAX_POP as i32) as u32;
+        if new_val == self.pop_amount { return; }
+        self.pop_amount = new_val;
+        self.sync_pop_buttons();
+        self.rebuild_from_params();
+    }
+
+    /// Reset pop sharpening to zero and rebuild.
+    pub(crate) fn reset_pop(&mut self) {
+        if self.pop_amount == 0 { return; }
+        self.pop_amount = 0;
+        self.sync_pop_buttons();
+        self.rebuild_from_params();
+    }
+
+    /// Sync disabled class on the ◀/▶ pop buttons to reflect the current amount.
+    fn sync_pop_buttons(&self) {
+        if self.pop_amount == 0 {
+            let _ = self.pop_dec_el.class_list().add_1("disabled");
+        } else {
+            let _ = self.pop_dec_el.class_list().remove_1("disabled");
+        }
+        if self.pop_amount >= MAX_POP {
+            let _ = self.pop_inc_el.class_list().add_1("disabled");
+        } else {
+            let _ = self.pop_inc_el.class_list().remove_1("disabled");
+        }
+    }
+
     // ── AA brush ─────────────────────────────────────────────────────────────
+
+    /// Return a reference to the sprite catalog for the currently active charset.
+    pub(crate) fn active_catalog(&self) -> &Vec<Vec<u8>> {
+        match self.aa_charset {
+            AaCharset::Ascii7  => &self.catalog_ascii7,
+            AaCharset::Braille => &self.catalog_braille,
+        }
+    }
+
+    /// Enable the charset-mode button. Called when AA mode turns on.
+    pub(crate) fn enable_aa_charset_btn(&self) {
+        let _ = self.aa_charset_btn_el.class_list().remove_1("disabled");
+    }
+
+    /// Disable the charset-mode button. Called when AA mode turns off.
+    pub(crate) fn disable_aa_charset_btn(&self) {
+        let _ = self.aa_charset_btn_el.class_list().add_1("disabled");
+    }
 
     /// Enable the AA mode button. Called after a background image is loaded.
     pub(crate) fn enable_aa_btn(&self) {
@@ -1536,7 +1743,7 @@ impl App {
     /// the catalog; falls back to brush_char if AA mode is off or no image is loaded.
     fn stamp_char(&self, col: usize, row: usize) -> char {
         if self.tool == Tool::Eraser { return BLANK; }
-        if self.aa_mode && self.bg_edges.is_some() && !self.sprite_catalog.is_empty() {
+        if self.aa_mode && self.bg_edges.is_some() && !self.active_catalog().is_empty() {
             self.compute_best_char(col, row)
         } else {
             self.brush_char
@@ -1551,7 +1758,8 @@ impl App {
             Some(e) => e,
             None    => return self.brush_char,
         };
-        if self.sprite_catalog.is_empty() { return self.brush_char; }
+        let catalog = self.active_catalog();
+        if catalog.is_empty() { return self.brush_char; }
 
         let proc_w = self.bg_luma_width  as f64;
         let proc_h = self.bg_luma_height as f64;
@@ -1609,8 +1817,8 @@ impl App {
         let patch_max = patch.iter().cloned().max().unwrap_or(0);
         let min_idx   = if patch_max >= asciiart::AA_EDGE_THRESHOLD { 1 } else { 0 };
 
-        let idx = asciiart::best_sprite_match(&patch, &self.sprite_catalog, min_idx);
-        (idx as u8 + 32) as char
+        let idx = asciiart::best_sprite_match(&patch, catalog, min_idx);
+        self.aa_charset.char_from_idx(idx)
     }
 
     // ── Text entry ───────────────────────────────────────────────────────────
@@ -1745,164 +1953,6 @@ impl App {
         self.render_cell(prev_col, row);
         self.cell_els[Grid::idx(prev_col, row)].class_list().add_1("cursor").unwrap();
         self.text_cursor = Some((prev_col, row));
-    }
-}
-
-// ── Sprite catalog ───────────────────────────────────────────────────────────
-
-/// Pre-render printable ASCII characters (codes 32–126) to grayscale bitmaps.
-///
-/// An off-screen canvas at SPRITE_W × SPRITE_H is reused for all 95 characters.
-/// Each character is rendered as black text on a white background so that:
-///   space (32) → all-white sprite ≈ bright image regions
-///   dense chars (@, #, …) → dark strokes on white ≈ dark image regions
-///
-/// The grayscale value used for comparison is the red channel (B&W canvas
-/// always has R = G = B). Returns 95 entries indexed as (char_code − 32),
-/// each SPRITE_W × SPRITE_H bytes. Returns an empty vec on any failure —
-/// stamp_char / compute_best_char degrade gracefully to brush_char.
-fn build_sprite_catalog(document: &Document) -> Vec<Vec<u8>> {
-    let canvas = match document
-        .create_element("canvas").ok()
-        .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-    {
-        Some(c) => c,
-        None    => return Vec::new(),
-    };
-    canvas.set_width(asciiart::SPRITE_W);
-    canvas.set_height(asciiart::SPRITE_H);
-
-    let ctx = match canvas
-        .get_context("2d").ok().flatten()
-        .and_then(|obj| obj.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
-    {
-        Some(c) => c,
-        None    => return Vec::new(),
-    };
-
-    let sw = asciiart::SPRITE_W as f64;
-    let sh = asciiart::SPRITE_H as f64;
-
-    // top-left origin keeps characters within the sprite bounds.
-    ctx.set_font(&format!("{}px monospace", asciiart::SPRITE_H));
-    ctx.set_text_align("left");
-    ctx.set_text_baseline("top");
-
-    let mut catalog = Vec::with_capacity(95);
-
-    for code in 32u8..=126u8 {
-        // Black background, white strokes — matches edge map representation
-        // (feature present = bright, nothing = dark) so SSD favours characters
-        // whose stroke directions align with the edge features in the image patch.
-        ctx.set_fill_style_str("black");
-        ctx.fill_rect(0.0, 0.0, sw, sh);
-        ctx.set_fill_style_str("white");
-        let _ = ctx.fill_text(&(code as char).to_string(), 0.0, 0.0);
-
-        let pixels = match ctx.get_image_data(0.0, 0.0, sw, sh) {
-            Ok(d)  => d,
-            Err(_) => {
-                // On failure push a blank (all-white) sprite so indices stay aligned.
-                catalog.push(vec![255u8; (asciiart::SPRITE_W * asciiart::SPRITE_H) as usize]);
-                continue;
-            }
-        };
-        // RGBA → grayscale: canvas is B&W so R = G = B; take R channel.
-        let gray: Vec<u8> = pixels.data().0.chunks(4).map(|px| px[0]).collect();
-        catalog.push(gray);
-    }
-
-    catalog
-}
-
-// ── DOM construction ─────────────────────────────────────────────────────────
-
-/// Populate `#grid` with COLS×ROWS `<span class="cell">` elements.
-/// Returns the flat element vec stored in App for direct render access.
-fn build_grid(document: &Document) -> Vec<Element> {
-    let container = document
-        .get_element_by_id("grid")
-        .expect("#grid must exist in HTML");
-
-    let mut cell_els = Vec::with_capacity(COLS * ROWS);
-    for r in 0..ROWS {
-        for c in 0..COLS {
-            let el = document
-                .create_element("span")
-                .expect("create_element failed");
-            el.set_class_name("cell");
-            // Store position as data attributes for hit-testing in mouse handlers.
-            el.set_attribute("data-col", &c.to_string()).unwrap();
-            el.set_attribute("data-row", &r.to_string()).unwrap();
-            el.set_text_content(Some(" "));
-            container.append_child(&el).unwrap();
-            cell_els.push(el);
-        }
-    }
-    cell_els
-}
-
-/// One entry in the character palette strip.
-struct PalEntry {
-    label:     &'static str, // visible glyph in the palette button
-    ch:        char,         // actual character value painted by this entry
-    initially_active: bool,
-}
-
-/// Populate `#palette` with character picker entries.
-/// Each entry gets a `data-char` attribute read by the click handler in wire_palette.
-fn build_palette(document: &Document) {
-    let container = document
-        .get_element_by_id("palette")
-        .expect("#palette must exist in HTML");
-
-    // "char:" label on the left edge of the palette strip
-    let lbl = document.create_element("span").unwrap();
-    lbl.set_class_name("palette-label");
-    lbl.set_text_content(Some("char:"));
-    container.append_child(&lbl).unwrap();
-
-    // None = visual separator between groups
-    // TBD: add more character groups (box-drawing styles, user custom chars, etc.)
-    let entries: &[Option<PalEntry>] = &[
-        Some(PalEntry { label: "█", ch: '█', initially_active: false }),
-        Some(PalEntry { label: "▓", ch: '▓', initially_active: false }),
-        Some(PalEntry { label: "▒", ch: '▒', initially_active: false }),
-        Some(PalEntry { label: "░", ch: '░', initially_active: false }),
-        None,
-        Some(PalEntry { label: "#", ch: '#', initially_active: false }),
-        Some(PalEntry { label: "*", ch: '*', initially_active: true }),
-        Some(PalEntry { label: "+", ch: '+', initially_active: false }),
-        Some(PalEntry { label: ".", ch: '.', initially_active: false }),
-        None,
-        Some(PalEntry { label: "─", ch: '─', initially_active: false }),
-        Some(PalEntry { label: "│", ch: '│', initially_active: false }),
-        Some(PalEntry { label: "┼", ch: '┼', initially_active: false }),
-        None,
-        Some(PalEntry { label: "⣠", ch: ' ', initially_active: false }), // space = erase
-    ];
-
-    for entry in entries {
-        match entry {
-            None => {
-                // Visual separator between palette groups
-                let sep = document.create_element("div").unwrap();
-                sep.set_class_name("pal-sep");
-                container.append_child(&sep).unwrap();
-            }
-            Some(e) => {
-                let el = document.create_element("div").unwrap();
-                el.set_class_name(if e.initially_active {
-                    "pal-char active"
-                } else {
-                    "pal-char"
-                });
-                el.set_text_content(Some(e.label));
-                // data-char carries the actual character value to the click handler.
-                el.set_attribute("data-char", &e.ch.to_string()).unwrap();
-                container.append_child(&el).unwrap();
-            }
-        }
     }
 }
 
@@ -2099,37 +2149,6 @@ fn art_char(dc: i32, dr: i32) -> char {
 }
 
 
-// ── Demo content ─────────────────────────────────────────────────────────────
-
-/// Draw a border and greeting to prove the Rust→DOM rendering pipeline works.
-/// Remove or replace once real drawing tools are exercised.
-fn draw_demo(app: &mut App) {
-    // Top and bottom edges
-    for c in 0..COLS {
-        app.grid.set_committed(c, 0,        '─');
-        app.grid.set_committed(c, ROWS - 1, '─');
-    }
-    // Left and right edges
-    for r in 0..ROWS {
-        app.grid.set_committed(0,        r, '│');
-        app.grid.set_committed(COLS - 1, r, '│');
-    }
-    // Corners
-    app.grid.set_committed(0,        0,        '┌');
-    app.grid.set_committed(COLS - 1, 0,        '┐');
-    app.grid.set_committed(0,        ROWS - 1, '└');
-    app.grid.set_committed(COLS - 1, ROWS - 1, '┘');
-
-    // Centered greeting
-    let msg: Vec<char> = "✦  charpaint  ✦".chars().collect();
-    let col0 = (COLS - msg.len()) / 2;
-    for (i, &ch) in msg.iter().enumerate() {
-        app.grid.set_committed(col0 + i, ROWS / 2, ch);
-    }
-
-    app.render_all();
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Build timestamp injected by build.rs — format "Build: MMDD:HHMM".
@@ -2146,8 +2165,8 @@ pub fn start() {
     let document: Document = window.document().expect("window has no document");
 
     // Build the dynamic DOM sections that Rust owns
-    let cell_els = build_grid(&document);
-    build_palette(&document);
+    let cell_els = dom_setup::build_grid(&document);
+    dom_setup::build_palette(&document);
 
     // Initialise shared application state (shared via Rc<RefCell> across closures)
     let grid_el = document.get_element_by_id("grid").unwrap();
@@ -2162,12 +2181,34 @@ pub fn start() {
     let bg_eye_el = document
         .get_element_by_id("bg-visibility-btn")
         .expect("#bg-visibility-btn must exist in HTML");
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el)));
+    let aa_charset_btn_el = document
+        .get_element_by_id("aa-charset-btn")
+        .expect("#aa-charset-btn must exist in HTML");
+    let image_controls_el = document
+        .get_element_by_id("image-controls")
+        .expect("#image-controls must exist in HTML");
+    let image_controls_hide_el = document
+        .get_element_by_id("image-controls-hide")
+        .expect("#image-controls-hide must exist in HTML")
+        .dyn_into::<web_sys::HtmlInputElement>()
+        .expect("#image-controls-hide must be an <input> element");
+    let texture_dec_el = document
+        .get_element_by_id("texture-dec")
+        .expect("#texture-dec must exist in HTML");
+    let texture_inc_el = document
+        .get_element_by_id("texture-inc")
+        .expect("#texture-inc must exist in HTML");
+    let pop_dec_el = document
+        .get_element_by_id("pop-dec")
+        .expect("#pop-dec must exist in HTML");
+    let pop_inc_el = document
+        .get_element_by_id("pop-inc")
+        .expect("#pop-inc must exist in HTML");
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el, aa_charset_btn_el, image_controls_el, image_controls_hide_el, texture_dec_el, texture_inc_el, pop_dec_el, pop_inc_el)));
 
-    // Build the sprite catalog (95 printable ASCII chars → grayscale bitmaps).
-    // Done after App is constructed so the canvas API is ready.
-    let catalog = build_sprite_catalog(&document);
-    app.borrow_mut().sprite_catalog = catalog;
+    // Build sprite catalogs for each charset at startup.
+    app.borrow_mut().catalog_ascii7  = dom_setup::build_ascii7_catalog(&document);
+    app.borrow_mut().catalog_braille = dom_setup::build_braille_catalog(&document);
 
     // Stamp the build time below the canvas so the version is always visible.
     if let Some(el) = document.get_element_by_id("build-info") {
@@ -2175,7 +2216,7 @@ pub fn start() {
     }
 
     // Populate the canvas with demo content to prove the pipeline end-to-end
-    draw_demo(&mut app.borrow_mut());
+    dom_setup::draw_demo(&mut app.borrow_mut());
 
     // Attach all event listeners — each takes a clone of the Rc, not ownership
     wire_grid_mouse(&document, &app);
@@ -2195,7 +2236,9 @@ pub fn start() {
     wire_drag_drop(&document, &app);
     wire_outline_mode(&document, &app);
     wire_aa_mode(&document, &app);
+    wire_aa_charset(&document, &app);
     wire_bg_visibility(&document, &app);
     wire_bg_move_tool(&document, &app);
     wire_load_image(&document, &app);
+    wire_image_controls(&document, &app);
 }

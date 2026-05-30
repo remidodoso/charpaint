@@ -4,13 +4,33 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
 
 ---
 
+## New project state & auto-BgMove
+
+`is_new_project: bool` in App — true on first load, true after a future "New Project" button press, false once the user has meaningfully started work. Two things end the new-project state:
+1. **First image loaded** — triggers auto-entry into BgMove so the user can immediately frame the image. Sets `is_new_project = false`.
+2. **First canvas touch** — same hook as `clear_demo_if_active()`. If the user paints before loading an image, auto-BgMove on a later image drop would be wrong, so the state ends here too.
+
+**Implementation note:** the auto-BgMove call in `process_bg_image` must happen *after* `enable_bg_eye()`, not before — `enable_bg_eye` currently calls `accept_bg_move()` if BgMove is already active (designed for second-image drops), which would immediately undo an auto-entry that happened earlier in the same function.
+
+**DOM class:** `enter_bg_move()` in App doesn't currently move the `.active` CSS class to the BgMove button (the wiring caller does that). Auto-entry needs App to do this itself — a small helper analogous to `restore_tool_active_class()` is needed.
+
+**"New Project" button (NIY):** Planned for the menubar. On press: clear canvas, clear background, reset `is_new_project = true`, `demo_active = false` (new project starts blank, no demo), reset texture/pop to 0. The current "new project" moment is just page load; "New" button makes it repeatable without a reload.
+
+---
+
 ## TODO
+
+- **Landscape / nature drawing tools** — specialised stamps or generators for natural motifs: a "leaf" brush (oval-ish with a vein), a "shining sun" (circle with radiating lines, possibly using the art-line tool's logic for the rays), foliage clusters, etc. Note: winter landscapes (bare trees, snow) already emerge naturally from the art-line tool's `\` `/` `|` characters — these new tools would extend that into warmer seasons. Could be implemented as parameterised stamp patterns or as dedicated tool modes.
+
+- **Nicer ovals / speech balloons** — the current oval tool uses integer Zingl-Bresenham which can look lumpy at small sizes. Investigate whether the character selection or the geometry algorithm can be improved for rounder-looking results. Speech balloons (oval + a "tail" pointing to a speaker) are a natural extension — the tail could be a short line or triangle drawn from a point on the oval perimeter toward a user-chosen direction.
 
 - **Multi-character brushes / brush shapes** — paint with a stamp larger than a single cell; e.g. 2×2 block, diagonal slash, custom pattern.
 
 - **Ink dropper** — click a cell on the canvas to pick up the character that's already there and make it the active brush character.
 
 - **Rework character palette** — the current palette strip is a static list; needs a redesign (scrollable set, categories, user-customisable slots, etc.).
+
+- **Ordered cell sequences in drawing tools** — every drawing tool (pencil, line, oval, rect, etc.) produces an ordered sequence of cells from start to end, with a consistent notion of "direction of drawing." This ordering should be a first-class concept available to all tools, so that character-assignment strategies (direction-based, sequential/rotating, 2D pattern fill, etc.) can be applied uniformly. Example patterns: "dot space dot space" along a line, `*-*-*-` along a stroke, or eventually 2D tiling patterns. Gap-filling via Bresenham is part of this: interpolated cells are ordered in the same direction as travel, so the sequence is always contiguous and unambiguous. The smart pencil and sequential character mode are the first consumers of this notion.
 
 - **"Smart pencil" / freehand-to-line mode** — a pencil sub-mode that interprets freehand strokes on the fly and substitutes directional line characters: `|` `-` `_` `/` `\`, possibly `(` `)` and others for curves. The challenge is doing this in real time as the stroke is drawn, not as a post-process. Needs a scheme for choosing the right character based on local stroke direction, and deciding how much smoothing / look-ahead to apply.
 

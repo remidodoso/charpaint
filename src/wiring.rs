@@ -154,8 +154,8 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
             None => continue,
         };
 
-        // Line, Fill, and BgMove have custom activation behaviour; wired separately.
-        if tool == Tool::Line || tool == Tool::Fill || tool == Tool::BgMove { continue; }
+        // Line, Pencil, Fill, and BgMove have custom activation behaviour; wired separately.
+        if tool == Tool::Line || tool == Tool::Pencil || tool == Tool::Fill || tool == Tool::BgMove { continue; }
 
         let app       = Rc::clone(app);
         let el_clone  = el.clone();
@@ -521,6 +521,90 @@ pub fn wire_copy(document: &Document, app: &Rc<RefCell<App>>) {
         });
         window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
+    }
+}
+
+/// Wire the `#pencil-tool-btn` pencil button.
+///
+/// Tap-to-select, tap-again-to-cycle:
+///   First tap when pencil is not active: activates the pencil tool.
+///   Second tap when already active: cycles PencilMode (Normal → Art → Normal)
+///     and updates the button icon.
+///
+/// Same three-listener pattern as `wire_line_tool`.
+pub fn wire_pencil_tool(document: &Document, app: &Rc<RefCell<App>>) {
+    let btn = match document.get_element_by_id("pencil-tool-btn") {
+        Some(el) => el,
+        None => return,
+    };
+
+    // touchstart — suppress synthetic mouse events from this button's tap.
+    {
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |e: TouchEvent| {
+            e.prevent_default();
+        });
+        btn.add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // touchend — select-or-cycle for touch devices.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(TouchEvent)>::new(move |_e: TouchEvent| {
+            pencil_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
+    // mousedown — select-or-cycle for desktop mouse, with coordinate guard.
+    {
+        let app       = Rc::clone(app);
+        let btn_clone = btn.clone();
+        let doc_clone = document.clone();
+        let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+            let rect = btn_clone.get_bounding_client_rect();
+            let x = e.client_x() as f64;
+            let y = e.client_y() as f64;
+            if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() {
+                return;
+            }
+            pencil_tool_tap(&app, &btn_clone, &doc_clone);
+        });
+        btn.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+}
+
+/// Shared action for touch and mouse pencil-tool taps.
+/// First tap (tool inactive): selects the pencil tool and moves `.active`.
+/// Second tap (tool already active): cycles PencilMode and updates icon/title.
+fn pencil_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
+    let already_active = app.borrow().tool == Tool::Pencil;
+
+    if already_active {
+        let mode = {
+            let mut a = app.borrow_mut();
+            a.pencil_mode = a.pencil_mode.cycle();
+            a.pencil_mode
+        };
+        btn.set_text_content(Some(mode.icon()));
+        btn.set_attribute("title", &format!("Pencil ({}) — tap again to cycle mode", mode.icon())).unwrap();
+    } else {
+        {
+            let mut a = app.borrow_mut();
+            a.commit_text_session();
+            a.clear_selection();
+            a.tool = Tool::Pencil;
+        }
+        let all = document.query_selector_all("[data-tool]").unwrap();
+        for j in 0..all.length() {
+            let t: Element = all.item(j).unwrap().dyn_into().unwrap();
+            t.class_list().remove_1("active").unwrap();
+        }
+        btn.class_list().add_1("active").unwrap();
     }
 }
 

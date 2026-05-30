@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0528:2313 -->
+<!-- build: 0529:1539 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -185,9 +185,27 @@
     }
     .img-ctrl-hide input { cursor: pointer; }
 
+    /* ── Main area + right column ────────────────────────────────────────── */
+    /* #main wraps toolbar + right-col; flips from column (mobile) to row     */
+    /* (tablet/desktop) via media query. min-height: 0 is required so nested  */
+    /* flex children can shrink and overflow correctly.                        */
+    #main {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    /* #right-col holds image-controls + canvas-wrap; always a column.        */
+    #right-col {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+
     /* ── Toolbar ──────────────────────────────────────────────────────────── */
-    /* Horizontal strip below the menu bar. tool-rows become vertical pairs    */
-    /* (each pair stacks top/bottom), the toolbar flows them left-to-right.   */
+    /* Mobile default: horizontal strip. Becomes a vertical left sidebar on   */
+    /* tablet/desktop via the responsive media query below.                   */
     #toolbar {
       background: var(--chrome);
       border-bottom: 1px solid var(--border);
@@ -385,6 +403,17 @@
       animation: cursor-blink 1s step-end infinite;
     }
 
+    /* ── Tool blink ───────────────────────────────────────────────────────────── */
+    /* Applied to #bg-move-btn while BgMove mode is active: pulses at ~1/s to    */
+    /* signal to the user that they should drag/scroll/pinch to frame the image.  */
+    @keyframes tool-blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.25; }
+    }
+    .tool.blinking {
+      animation: tool-blink 1s step-end infinite;
+    }
+
     /* ── Help mode ────────────────────────────────────────────────────────────── */
 
     /* ? button — position:relative + z-index:101 places it above the overlay     */
@@ -456,6 +485,29 @@
       color: var(--accent);
       margin-bottom: 3px;
     }
+
+    /* ── Responsive: tablet / desktop (≥768px) ───────────────────────────── */
+    /* Toolbar moves from a horizontal top strip to a vertical left sidebar.  */
+    @media (min-width: 768px) {
+      #main    { flex-direction: row; }
+
+      #toolbar {
+        flex-direction: column;
+        border-bottom: none;
+        border-right: 1px solid var(--border);
+        overflow-x: visible;
+        overflow-y: auto;
+      }
+      /* tool-rows become horizontal pairs so the sidebar is two tools wide   */
+      .tool-row { flex-direction: row; }
+      /* separator rotates from vertical rule to horizontal rule              */
+      .tool-sep {
+        width: auto;
+        align-self: stretch;
+        height: 1px;
+        margin: 4px 0;
+      }
+    }
   </style>
 </head>
 <body>
@@ -477,6 +529,7 @@
     <button id="theme-toggle" data-help="theme">☀ Light</button>
   </div>
 
+  <div id="main">
   <!-- Toolbar — icons and data-tool attrs defined here; click handlers wired by Rust -->
   <div id="toolbar">
       <!-- Blend mode tile: shows current mode icon; mousedown+drag opens the fly-out (wired by Rust) -->
@@ -487,7 +540,7 @@
       </div>
       <div class="tool-sep"></div>
       <div class="tool-row">
-        <div class="tool active" data-tool="pencil" title="Pencil" data-help="pencil">✎</div>
+        <div class="tool active" id="pencil-tool-btn" data-tool="pencil" title="Pencil — tap again to cycle mode" data-help="pencil">✎</div>
         <div class="tool"        data-tool="select" title="Select" data-help="select">⬚</div>
       </div>
       <div class="tool-row">
@@ -532,6 +585,7 @@
       </div>
   </div>
 
+  <div id="right-col">
   <!-- Image controls — shown by Rust when BgMove tool is active; hidden otherwise.
        Arrows adjust; clicking the label resets to zero. -->
   <div id="image-controls">
@@ -554,6 +608,8 @@
       <!-- Build timestamp set by Rust at startup via env!("BUILD_TIMESTAMP") -->
       <div id="build-info"></div>
   </div>
+  </div><!-- end right-col -->
+  </div><!-- end main -->
 
   <!-- Palette entries are created programmatically by Rust (build_palette) -->
   <!-- data-help="palette" on the container: find_help_key walks up to this when -->

@@ -17,7 +17,7 @@ mod asciiart;
 mod dom_setup;
 
 mod wiring;
-use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode, wire_aa_charset, wire_bg_visibility, wire_bg_move_tool, wire_load_image, wire_image_controls};
+use wiring::{wire_grid_mouse, wire_toolbar, wire_palette, wire_undo_redo, wire_theme_toggle, wire_blend_mode, wire_line_tool, wire_pencil_tool, wire_fill_tool, wire_copy, wire_clear, wire_touch, wire_shift_toggle, wire_text_input, wire_help, wire_drag_drop, wire_outline_mode, wire_aa_mode, wire_aa_charset, wire_bg_visibility, wire_bg_move_tool, wire_load_image, wire_image_controls};
 
 // Help strings generated from locales/help.en.yaml by build.rs.
 include!(concat!(env!("OUT_DIR"), "/help_strings.rs"));
@@ -102,6 +102,32 @@ impl LineMode {
         match self {
             LineMode::Character => LineMode::Art,
             LineMode::Art       => LineMode::Character,
+        }
+    }
+}
+
+// ── PencilMode ────────────────────────────────────────────────────────────────
+
+/// Whether the pencil stamps the brush character or selects - | \ / per step direction.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum PencilMode {
+    Normal, // stamp brush_char — classic freehand paint
+    Art,    // select - | \ / per step direction — smooth geometric strokes
+}
+
+impl PencilMode {
+    pub(crate) fn icon(&self) -> &'static str {
+        match self {
+            PencilMode::Normal => "✎",
+            PencilMode::Art    => "~",
+        }
+    }
+
+    /// Advance to the next pencil mode.
+    pub(crate) fn cycle(&self) -> Self {
+        match self {
+            PencilMode::Normal => PencilMode::Art,
+            PencilMode::Art    => PencilMode::Normal,
         }
     }
 }
@@ -390,12 +416,17 @@ pub(crate) struct App {
     /// clear_demo_if_active() which is called at the top of every mousedown
     /// and touchstart handler so the demo is never captured in undo history.
     pub(crate) demo_active: bool,
+    /// True from first load (or future New Project) until the user either paints
+    /// on the canvas or loads a background image. Used to auto-enter BgMove on
+    /// the first image drop. TBD: reset to true by a future "New Project" action.
+    pub(crate) is_new_project: bool,
 
     pub(crate) shift_locked: bool,       // true when the ⇧ toggle is active (axis constraint)
     pub(crate) dark_mode: bool,
-    pub(crate) blend_mode: BlendMode, // how new paint interacts with existing cells
-    pub(crate) line_mode:  LineMode,  // character-stamp vs art-geometry line drawing
-    pub(crate) fill_mode:  FillMode,  // 4-adjacent vs 8-adjacent flood fill
+    pub(crate) blend_mode:   BlendMode,   // how new paint interacts with existing cells
+    pub(crate) line_mode:    LineMode,    // character-stamp vs art-geometry line drawing
+    pub(crate) pencil_mode:  PencilMode,  // normal freehand vs art-geometry pencil
+    pub(crate) fill_mode:    FillMode,    // 4-adjacent vs 8-adjacent flood fill
 
     /// Active selection bounding box (c0, r0, c1, r1), normalized so c0≤c1, r0≤r1.
     /// None means no selection. Cleared on tool switch or ESC; persists after mouseup.
@@ -504,6 +535,8 @@ pub(crate) struct App {
     /// Reference to #image-controls-hide checkbox — unchecked each time the strip is shown
     /// so it always starts fresh when BgMove is re-entered.
     image_controls_hide_el: web_sys::HtmlInputElement,
+    /// #bg-move-btn — held so enter/accept/cancel_bg_move can add/remove `.blinking`.
+    bg_move_btn_el: Element,
     /// ◀ / ▶ buttons for texture sharpening — kept here so sync_texture_buttons can
     /// add/remove the `disabled` class without a document lookup on every change.
     texture_dec_el: Element,
@@ -522,7 +555,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element, aa_charset_btn_el: Element, image_controls_el: Element, image_controls_hide_el: web_sys::HtmlInputElement, texture_dec_el: Element, texture_inc_el: Element, pop_dec_el: Element, pop_inc_el: Element) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element, aa_charset_btn_el: Element, image_controls_el: Element, image_controls_hide_el: web_sys::HtmlInputElement, texture_dec_el: Element, texture_inc_el: Element, pop_dec_el: Element, pop_inc_el: Element, bg_move_btn_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -535,11 +568,13 @@ impl App {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             demo_active: true,
+            is_new_project: true,
             shift_locked: false,
             dark_mode:  true,
-            blend_mode: BlendMode::Overwrite,
-            line_mode:  LineMode::Character,
-            fill_mode:  FillMode::Flood4,
+            blend_mode:   BlendMode::Overwrite,
+            line_mode:    LineMode::Character,
+            pencil_mode:  PencilMode::Normal,
+            fill_mode:    FillMode::Flood4,
             selection: None,
             text_cursor: None,
             text_origin: None,
@@ -579,6 +614,7 @@ impl App {
             help_mode:             false,
             image_controls_el,
             image_controls_hide_el,
+            bg_move_btn_el,
             texture_dec_el,
             texture_inc_el,
             pop_dec_el,
@@ -627,6 +663,7 @@ impl App {
         for cell in self.grid.committed.iter_mut() { *cell = BLANK; }
         self.render_all();
         self.demo_active = false;
+        self.is_new_project = false; // painting before an image load ends new-project state
     }
 
     // ── Painting ─────────────────────────────────────────────────────────────
@@ -695,22 +732,78 @@ impl App {
     ///       always shows exactly the final line, not a smear of all positions.
     pub(crate) fn paint_stroke_to(&mut self, col: usize, row: usize, shift_held: bool) {
         match self.tool {
-            Tool::Pencil | Tool::Eraser => {
+            Tool::Pencil => {
+                let (col, row) = self.resolve_target(col, row, shift_held || self.shift_locked);
+                let cells = match self.last_painted_cell {
+                    Some((pc, pr)) => bresenham(pc, pr, col, row),
+                    None           => vec![(col, row)],
+                };
+
+                match self.pencil_mode {
+                    PencilMode::Normal => {
+                        for (c, r) in cells {
+                            if self.blend_mode == BlendMode::Stamp
+                                && self.grid.committed[Grid::idx(c, r)] != BLANK
+                            {
+                                continue;
+                            }
+                            let ch = self.stamp_char(c, r);
+                            self.grid.set_preview(c, r, Some(ch));
+                            self.render_cell(c, r);
+                        }
+                    }
+                    PencilMode::Art => {
+                        // cells[0] == last_painted_cell when last_painted_cell is Some.
+                        // We retroactively correct it with the now-known exit direction,
+                        // then assign direction-based chars to the remaining new cells.
+                        let prev_was_some = self.last_painted_cell.is_some();
+                        for (i, &(c, r)) in cells.iter().enumerate() {
+                            if i == 0 && prev_was_some {
+                                // Retroactive fix: update last_painted_cell's char using
+                                // the direction to the next cell (cells[1]).
+                                if cells.len() > 1 {
+                                    let (nc, nr) = cells[1];
+                                    let ch = art_char((nc as i32) - (c as i32), (nr as i32) - (r as i32));
+                                    self.grid.set_preview(c, r, Some(ch));
+                                    self.render_cell(c, r);
+                                }
+                                // cells[0] = last_painted_cell: always skip normal processing.
+                                continue;
+                            }
+                            if self.blend_mode == BlendMode::Stamp
+                                && self.grid.committed[Grid::idx(c, r)] != BLANK
+                            {
+                                continue;
+                            }
+                            // Direction from previous cell in the batch.
+                            let ch = if i == 0 {
+                                // First-ever cell of the stroke — no direction yet.
+                                '-'
+                            } else {
+                                let (pc, pr) = cells[i - 1];
+                                art_char((c as i32) - (pc as i32), (r as i32) - (pr as i32))
+                            };
+                            self.grid.set_preview(c, r, Some(ch));
+                            self.render_cell(c, r);
+                        }
+                    }
+                }
+                self.last_painted_cell = Some((col, row));
+            }
+
+            Tool::Eraser => {
                 let (col, row) = self.resolve_target(col, row, shift_held || self.shift_locked);
                 let cells = match self.last_painted_cell {
                     Some((pc, pr)) => bresenham(pc, pr, col, row),
                     None           => vec![(col, row)],
                 };
                 for (c, r) in cells {
-                    // Stamp: only paint blank cells; test committed so earlier preview
-                    // cells in this stroke don't shadow the check.
                     if self.blend_mode == BlendMode::Stamp
                         && self.grid.committed[Grid::idx(c, r)] != BLANK
                     {
                         continue;
                     }
-                    // Compute per-cell: eraser always BLANK; AA mode looks up image.
-                    let ch = self.stamp_char(c, r);
+                    let ch = self.stamp_char(c, r); // eraser always returns BLANK
                     self.grid.set_preview(c, r, Some(ch));
                     self.render_cell(c, r);
                 }
@@ -1300,7 +1393,15 @@ impl App {
         self.rebuild_from_params(); // sets bg_luma, bg_edges, calls rebuild_background
         // Unlock the AA brush and eye toggle; reset visibility to shown.
         self.enable_aa_btn();
-        self.enable_bg_eye();
+        self.enable_bg_eye(); // must run before auto-BgMove (it exits BgMove if already active)
+        // On first image load in a new project, automatically enter BgMove so the
+        // user is immediately invited to frame the image. TBD: reset is_new_project
+        // to true on a future "New Project" action.
+        if self.is_new_project {
+            self.is_new_project = false;
+            self.enter_bg_move();
+            self.restore_tool_active_class(Tool::BgMove);
+        }
     }
 
     /// Re-render the stored luma data as a background image according to the current
@@ -1424,6 +1525,7 @@ impl App {
         self.bg_move_saved = Some((self.bg_pos_x, self.bg_pos_y, self.bg_disp_w, self.bg_disp_h));
         self.tool = Tool::BgMove;
         self.show_image_controls(); // always show fresh (resets dismiss checkbox)
+        let _ = self.bg_move_btn_el.class_list().add_1("blinking");
     }
 
     /// Accept current position and exit BgMove mode, restoring the previous tool.
@@ -1434,6 +1536,7 @@ impl App {
         self.tool = prev;
         self.restore_tool_active_class(prev);
         self.hide_image_controls();
+        let _ = self.bg_move_btn_el.class_list().remove_1("blinking");
     }
 
     /// Cancel BgMove: revert position/scale to the snapshot taken at entry, then exit.
@@ -1451,6 +1554,7 @@ impl App {
         self.tool = prev;
         self.restore_tool_active_class(prev);
         self.hide_image_controls();
+        let _ = self.bg_move_btn_el.class_list().remove_1("blinking");
     }
 
     /// Move the `.active` CSS class to the `[data-tool]` button matching `tool`.
@@ -2204,7 +2308,10 @@ pub fn start() {
     let pop_inc_el = document
         .get_element_by_id("pop-inc")
         .expect("#pop-inc must exist in HTML");
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el, aa_charset_btn_el, image_controls_el, image_controls_hide_el, texture_dec_el, texture_inc_el, pop_dec_el, pop_inc_el)));
+    let bg_move_btn_el = document
+        .get_element_by_id("bg-move-btn")
+        .expect("#bg-move-btn must exist in HTML");
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el, aa_charset_btn_el, image_controls_el, image_controls_hide_el, texture_dec_el, texture_inc_el, pop_dec_el, pop_inc_el, bg_move_btn_el)));
 
     // Build sprite catalogs for each charset at startup.
     app.borrow_mut().catalog_ascii7  = dom_setup::build_ascii7_catalog(&document);
@@ -2226,6 +2333,7 @@ pub fn start() {
     wire_theme_toggle(&document, &app);
     wire_blend_mode(&document, &app);
     wire_line_tool(&document, &app);
+    wire_pencil_tool(&document, &app);
     wire_fill_tool(&document, &app);
     wire_copy(&document, &app);
     wire_clear(&document, &app);

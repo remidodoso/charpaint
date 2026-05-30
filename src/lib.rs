@@ -475,6 +475,11 @@ pub(crate) struct App {
     /// Recomputed by rebuild_from_params whenever contrast_index changes.
     /// None until first rebuild_from_params call after image load.
     pub(crate) bg_luma:        Option<Vec<u8>>,
+    /// Pixel-wise inversion of bg_luma (255 - luma). Pre-computed so compute_best_char
+    /// can read directly without per-pixel inversion in the hot loop.
+    /// Used for AA matching in Original (grayscale) display mode — maintains the
+    /// "white = stroke" invariant: dark image areas become bright, matching dense chars.
+    pub(crate) bg_luma_neg:    Option<Vec<u8>>,
     pub(crate) bg_luma_width:  u32,
     pub(crate) bg_luma_height: u32,  // current processed image height
     /// Dimensions of bg_luma_raw — the original downsample from the loaded image.
@@ -596,6 +601,7 @@ impl App {
             bg_move_saved:         None,
             bg_luma_raw:           None,
             bg_luma:               None,
+            bg_luma_neg:           None,
             bg_luma_width:         0,
             bg_luma_height:        0,
             bg_luma_raw_width:     0,
@@ -1800,6 +1806,7 @@ impl App {
         };
         let mut edges = asciiart::sobel_edges(&luma, w, h);
         asciiart::enhance_edges(&mut edges);
+        self.bg_luma_neg = Some(luma.iter().map(|&v| 255 - v).collect());
         self.bg_luma  = Some(luma);
         self.bg_edges = Some(edges);
         self.rebuild_background();
@@ -1903,8 +1910,14 @@ impl App {
     /// catalog using sum-of-squared-differences, and return the best-matching char.
     /// Falls back to brush_char if any data is unavailable.
     fn compute_best_char(&self, col: usize, row: usize) -> char {
-        let edges = match self.bg_edges.as_ref() {
-            Some(e) => e,
+        // Source selection: grayscale mode matches against inverted luma (white=stroke
+        // invariant); edge modes match against the edge map.
+        let source = match self.bg_outline_mode {
+            BgOutlineMode::Original => self.bg_luma_neg.as_ref(),
+            _                       => self.bg_edges.as_ref(),
+        };
+        let edges = match source {
+            Some(s) => s,
             None    => return self.brush_char,
         };
         let catalog = self.active_catalog();

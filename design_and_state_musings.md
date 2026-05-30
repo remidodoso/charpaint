@@ -7,8 +7,8 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
 ## New project state & auto-BgMove
 
 `is_new_project: bool` in App — true on first load, true after a future "New Project" button press, false once the user has meaningfully started work. Two things end the new-project state:
-1. **First image loaded** — triggers auto-entry into BgMove so the user can immediately frame the image. Sets `is_new_project = false`.
-2. **First canvas touch** — same hook as `clear_demo_if_active()`. If the user paints before loading an image, auto-BgMove on a later image drop would be wrong, so the state ends here too.
+1. **First image loaded** — originally triggered auto-entry into BgMove only on first load. **Updated:** BgMove is now entered automatically on *every* image drop, not just the first — the user always wants to frame a new image. `is_new_project` no longer gates this; `process_bg_image` unconditionally calls `enter_bg_move()`.
+2. **First canvas touch** — same hook as `clear_demo_if_active()`. Still resets `is_new_project` to false, which matters for the future "New Project" button.
 
 **Implementation note:** the auto-BgMove call in `process_bg_image` must happen *after* `enable_bg_eye()`, not before — `enable_bg_eye` currently calls `accept_bg_move()` if BgMove is already active (designed for second-image drops), which would immediately undo an auto-entry that happened earlier in the same function.
 
@@ -32,7 +32,7 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
 
 - **Ordered cell sequences in drawing tools** — every drawing tool (pencil, line, oval, rect, etc.) produces an ordered sequence of cells from start to end, with a consistent notion of "direction of drawing." This ordering should be a first-class concept available to all tools, so that character-assignment strategies (direction-based, sequential/rotating, 2D pattern fill, etc.) can be applied uniformly. Example patterns: "dot space dot space" along a line, `*-*-*-` along a stroke, or eventually 2D tiling patterns. Gap-filling via Bresenham is part of this: interpolated cells are ordered in the same direction as travel, so the sequence is always contiguous and unambiguous. The smart pencil and sequential character mode are the first consumers of this notion.
 
-- **"Smart pencil" / freehand-to-line mode** — a pencil sub-mode that interprets freehand strokes on the fly and substitutes directional line characters: `|` `-` `_` `/` `\`, possibly `(` `)` and others for curves. The challenge is doing this in real time as the stroke is drawn, not as a post-process. Needs a scheme for choosing the right character based on local stroke direction, and deciding how much smoothing / look-ahead to apply.
+- **"Smart pencil" / freehand-to-line mode** *(partially implemented — see Implemented section)* — a pencil sub-mode that interprets freehand strokes on the fly and substitutes directional line characters: `|` `-` `_` `/` `\`, possibly `(` `)` and others for curves. The basic 4-direction version is working; `_`, `(`, `)` rounding cases and backtrack behaviour are not yet handled.
 
 - **Background image tone controls** — adjustable parameters for brightness, contrast, edge blend, etc. that feed directly into the AA conversion pipeline (not just the visual overlay).
 
@@ -63,7 +63,7 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
       - **Two separate fixed-radius controls** (no tweakable radius): "Texture" (small, ~10–11 processing pixels ≈ 3pt at canvas scale, good for strokes/hatching/fine detail) and "Pop" (large, ~40–60px ≈ one canvas cell, good for faces/silhouettes/coarse structure).
       - **Implementation**: box blur (sliding window average) is O(W×H) *regardless of radius* and is the right tool — no need for true Gaussian. The blur in the USM formula only needs to estimate local average at the target scale; the exact kernel shape (bell vs. flat rectangle) is irrelevant since you're subtracting it to get a detail signal that feeds into Sobel anyway. Single-pass box blur for texture radius is probably adequate. Two or three passes for pop radius (triangular/quasi-Gaussian kernel) avoids flat-topped halos at large radii. Each pass is still O(W×H) so 3-pass large-radius costs the same as 1-pass small-radius. Photoshop's "Gaussian Blur" filter is one of the very few tools that actually uses a true Gaussian; almost everything else uses stacked box blur or similar.
       - **Amount**: off / mild (0.5×) / strong (1.5–2×) discrete steps for each control, using ◀ ▶ arrows or similar. Default off.
-      - **TODO: implement and experiment.**
+      - **Implemented, then sidelined.** Texture (radius ~10px) and Pop (radius ~45px) USM controls were built and exposed as ◀▶ buttons in the image-controls strip, but were removed after finding the effect underwhelming. Code preserved in `asciiart.rs` with `#[allow(dead_code)]`. The pre-blur in `reprocess_edges_for_scale` now handles scale-appropriate smoothing more principally — see the Scale-adaptive edge detection note.
     - *Edge blend* — edge-vs-luminance mix for the AA brush (see AA source signal note); steps of 10%, 0–100%.
     - Later candidates: *edge threshold*, *pre-blur radius*.
   - **Pipeline implication:** processing is currently one-shot at image load. Live tweaking requires storing the raw luma data (`bg_luma_raw`) before any brightness/contrast transform, so control changes re-derive the processed maps from the original rather than reloading the image.
@@ -83,6 +83,11 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
 - **AA post-process: peephole optimisation** — after the AA brush paints a region, run a lightweight pass over the *character output* (not the source image) to regularise near-straight runs. E.g. a sequence of cells that are mostly `|` with one stray `/` gets corrected to all `|`; a diagonal run of mixed `/` and `\` gets snapped to whichever is dominant. This is a classic peephole approach — small sliding window, local pattern matching, simple substitution rules. Should be optional and relatively straightforward to implement; no image-space analysis needed since it operates purely on the already-chosen characters. **Note:** the substitution rules here are analogous to — but probably not identical to — the rules needed for the smart pencil freehand-to-line mode. Both reason about local character runs and directionality, so there may be shared logic or a common rule table worth factoring out, but the inputs differ (AA output cells vs. live stroke path) so they shouldn't be forced to share prematurely.
 
 - **AA tuning philosophy** — all the signal-mixing, feature-extraction, and tone-control questions above share a common answer: *experiment and develop heuristics*. Don't over-design the pipeline in advance; build controls that expose the raw parameters and let empirical testing with real images dictate what the defaults and interactions should be.
+
+- **AA matching semantic — "white = stroke" invariant** — the matching pipeline always expects its source image in white-on-black orientation: bright pixels mean ink/stroke present, dark pixels mean empty space. This is why `bg_edges` works directly (edges are white on black). It also implies that matching against a grayscale image requires using the **inverted** ("negative") grayscale — `255 - luma` — not the original. A white sky in the source image becomes dark in the inverted version, which correctly matches to sparse/empty characters. A dark shadow becomes bright, correctly matching to dense characters. The user is always shown the original un-inverted grayscale; the inversion is an internal matching detail only. The three background display modes map to matching sources as follows:
+  - **Grayscale (`Original`)** → match against `255 - bg_luma` (inverted grayscale, stored as `bg_luma_neg`)
+  - **Edges white-on-black (`WhiteOnBlack`)** → match against `bg_edges` (current behaviour)
+  - **Edges black-on-white (`BlackOnWhite`)** → match against `bg_edges` (same data as above; display inversion is cosmetic only)
 
 - **Scale-adaptive edge detection (implemented)** — the Sobel edge detector runs on `bg_luma_raw` (the full image at processing resolution, `PROCESSING_HEIGHT = 1024`). The processed `bg_edges` covers the whole image; the CSS pan/zoom model is unchanged. The only thing that varies with zoom is the **pre-blur radius** applied to `bg_luma_raw` before Sobel.
 
@@ -109,3 +114,28 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
   **Decided:** A "recently used" strip — à la recent colours in colour pickers — will definitely be implemented. It self-populates as the user paints and surfaces the characters they actually care about without any explicit management.
 
   **Still a head-scratcher:** cold-start discovery of arbitrary Unicode on mobile. The OS keyboard is actually a decent picker (e.g. an IPA keyboard installed on the phone gives access to a wide range of unusual characters), but the challenge remains routing a character from a keyboard input back to the *brush* rather than onto the canvas. No clean solution yet.
+
+---
+
+## Implemented — session notes
+
+**Art pencil mode (implemented)**
+
+A second mode of the pencil tool, cycled by tapping the pencil button while it's already active. Icon: `~`. On each Bresenham-interpolated step, `art_char(dc, dr)` selects `-` `|` `/` `\` based on the direction of travel. The previous cell is retroactively corrected when its exit direction becomes known (i.e., when the cursor moves to the next cell). The first cell of a stroke gets `-` as a placeholder. On pointer-up, the stroke is committed via the normal preview system (`set_preview` / `render_cell`). Follows the same tap-to-cycle pattern as the line/art-line tool. Remaining work: `_`, `(`, `)` rounding cases; backtracking behaviour.
+
+**Styled HTML clipboard copy (implemented)**
+
+The copy button and Ctrl+C now place both `text/plain` and `text/html` on the clipboard simultaneously using `ClipboardItem`. The HTML is a `<pre>` block with `font-family: monospace; line-height: 1.2; white-space: pre` — no color styling (reserved for when per-cell color is added). Trailing spaces are trimmed per line since rich-text editors (Docs, Notion, Slack) drop them anyway. The JS helper `charpaintCopyRich(plain, html)` in `index.html` handles the `ClipboardItem`/`Blob` construction; Rust calls it via `js_sys::Reflect` without needing a `#[wasm_bindgen]` extern. Both the button and the Ctrl+C keyboard path share a single `rich_copy()` async helper in `wiring.rs`.
+
+**BgMove tool lifecycle fixes (implemented)**
+
+- `leave_bg_move_ui()` — a thin helper that removes `.blinking` from the BgMove button and hides the image-controls strip without touching tool state or background position. Called by the generic toolbar handler and by the tap handlers for pencil, line, and fill (all of which previously set `tool` directly, leaving the UI in a blinking/visible state after switching away from BgMove).
+- `reprocess_edges_for_scale()` is called from `accept_bg_move()` as a final sync, so the edge map always reflects the accepted framing before the tool exits.
+
+**Image-controls strip — current state**
+
+The Texture and Pop USM controls were removed from the strip after finding them ineffective. The strip now shows only the Hide checkbox. The strip structure is preserved for future controls (the "more edge / less edge" slider discussed but not yet designed).
+
+**AA matching source selection (implemented)**
+
+`compute_best_char` now selects its source image based on `bg_outline_mode`: `Original` (grayscale display) uses `bg_luma_neg` (`255 - luma`); edge modes use `bg_edges`. `bg_luma_neg` is pre-computed in `rebuild_from_params()` alongside `bg_luma` — one pass, no extra processing. The rest of the matching pipeline (box-average patch, SSD, `AA_EDGE_THRESHOLD` check) is identical for both sources. Knobs for the user to control matching parameters are a next step.

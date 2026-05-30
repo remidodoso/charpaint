@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- build: 0529:1539 -->
+<!-- build: 0529:2350 -->
 <!--
   charpaint — structural shell and styles only.
   All DOM construction, event handling, and application logic lives in src/lib.rs
@@ -589,13 +589,6 @@
   <!-- Image controls — shown by Rust when BgMove tool is active; hidden otherwise.
        Arrows adjust; clicking the label resets to zero. -->
   <div id="image-controls">
-    <button id="texture-dec" class="img-ctrl-btn disabled" title="Less texture sharpening">◀</button>
-    <span class="img-ctrl-label" id="texture-label" title="Click to reset">Texture</span>
-    <button id="texture-inc" class="img-ctrl-btn" title="More texture sharpening">▶</button>
-    <span class="img-ctrl-sep"></span>
-    <button id="pop-dec" class="img-ctrl-btn disabled" title="Less pop sharpening">◀</button>
-    <span class="img-ctrl-label" id="pop-label" title="Click to reset">Pop</span>
-    <button id="pop-inc" class="img-ctrl-btn" title="More pop sharpening">▶</button>
     <span class="spacer"></span>
     <label class="img-ctrl-hide">
       <input type="checkbox" id="image-controls-hide"> Hide
@@ -651,6 +644,16 @@
     <span id="help-popup-key"></span><span id="help-popup-text"></span>
   </div>
 
+  <script>
+    // Multi-format clipboard write: plain text + styled HTML in one ClipboardItem.
+    // The receiving app silently picks the richest format it can handle.
+    async function charpaintCopyRich(plain, html) {
+      await navigator.clipboard.write([new ClipboardItem({
+        'text/plain': new Blob([plain], { type: 'text/plain' }),
+        'text/html':  new Blob([html],  { type: 'text/html'  }),
+      })]);
+    }
+  </script>
   <script type="module">
     // Minimal loader — all application logic is in the Rust/WASM module.
     import init from './pkg/charpaint.js';

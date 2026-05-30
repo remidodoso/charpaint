@@ -84,6 +84,26 @@ Maintain a running notes file (`design_and_state_musings.md`) to capture design 
 
 - **AA tuning philosophy** — all the signal-mixing, feature-extraction, and tone-control questions above share a common answer: *experiment and develop heuristics*. Don't over-design the pipeline in advance; build controls that expose the raw parameters and let empirical testing with real images dictate what the defaults and interactions should be.
 
+- **Scale-adaptive edge detection (implemented)** — the Sobel edge detector runs on `bg_luma_raw` (the full image at processing resolution, `PROCESSING_HEIGHT = 1024`). The processed `bg_edges` covers the whole image; the CSS pan/zoom model is unchanged. The only thing that varies with zoom is the **pre-blur radius** applied to `bg_luma_raw` before Sobel.
+
+  **Reasoning:** a normal-weight 12pt font has stroke widths of approximately 1pt. The canvas represents 24 rows × 12pt = 288pt ≈ 300pt of vertical content. So the feature scale we need to resolve is 1/300 of the canvas height. In processing pixels, this is:
+
+  ```
+  feature_px = (ROWS × cell_h) / 300  =  cell_h / 12.5
+  ```
+
+  where `cell_h = bg_visible_rect.3` (processing pixels per character row at current zoom).
+
+  A box blur at radius `≈ cell_h / 12.5` (minimum 1) before Sobel suppresses sub-stroke noise while preserving stroke-width edges. As the user zooms in, `cell_h` decreases, the radius shrinks, and the edge map becomes finer — showing detail appropriate to the zoomed-in view. As the user zooms out, the radius grows, suppressing fine detail and leaving only coarse structure visible at character-cell scale.
+
+  **Implementation:** `reprocess_edges_for_scale()` in `lib.rs`, called on `accept_bg_move()` and debounced 500ms after zoom-idle events. Uses `asciiart::scale_blur()` (a two-pass H+V box blur returning `u8`), which reuses the `box_blur_h` / `box_blur_v` helpers originally written for the USM controls. The USM controls themselves were sidelined as ineffective — the pre-blur here supersedes their role in a more principled way.
+
+  **Debounce:** wheel and pinch zoom events increment `zoom_debounce_gen` and schedule a 500ms `setTimeout`. When the timer fires it checks the generation and no-ops if stale. `accept_bg_move()` also calls `reprocess_edges_for_scale()` directly as a final sync (and bumps the gen to cancel pending timers).
+
+  **Zoom limits:** `bg_luma_raw_width` / `bg_luma_raw_height` store the original processing dimensions and are used for pan/zoom limits so those limits remain stable even if future processing changes `bg_luma_width`/`height`.
+
+  **TODO:** try making the reprocess fully interactive (per zoom event, not debounced) — the pre-blur + Sobel pipeline at processing resolution may be fast enough.
+
 - **Arbitrary Unicode character picker** — the current fixed palette (`.`, `*`, box-drawing chars, etc.) works surprisingly well but is a small curated slice of Unicode. The open question is: how do you let someone pick *any* Unicode character as their brush, especially on mobile?
 
   **Decided:** A "recently used" strip — à la recent colours in colour pickers — will definitely be implemented. It self-populates as the user paints and surfaces the characters they actually care about without any explicit management.

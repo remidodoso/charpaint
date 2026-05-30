@@ -16,6 +16,24 @@ use wasm_bindgen_futures::spawn_local;
 use crate::{App, Tool};
 use crate::util::{cell_from_coords, cell_from_mouse_event, flash_button, flash_button_error};
 
+/// Schedule a 500 ms idle-reprocess after a BgMove zoom gesture.
+/// Uses a generation counter: if the gen has advanced by the time the timer fires,
+/// the closure no-ops. Each call leaks one tiny Closure::once — bounded per session.
+fn schedule_zoom_reprocess(app: &Rc<RefCell<App>>) {
+    let generation = app.borrow_mut().bump_zoom_debounce();
+    let app_weak   = Rc::clone(app);
+    let cb = Closure::once(move || {
+        let mut a = app_weak.borrow_mut();
+        if a.tool == Tool::BgMove && a.zoom_debounce_gen == generation {
+            a.reprocess_edges_for_scale();
+        }
+    });
+    let _ = web_sys::window()
+        .unwrap()
+        .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 500);
+    cb.forget();
+}
+
 /// Attach mouse handlers to `#grid` and a global mouseup handler to `window`.
 ///
 /// mousedown → begin stroke and paint first cell
@@ -126,6 +144,7 @@ pub fn wire_grid_mouse(document: &Document, app: &Rc<RefCell<App>>) {
                 _ => e.delta_y() * 300.0,
             };
             app.borrow_mut().zoom_bg_image(delta, pivot_x, pivot_y);
+            schedule_zoom_reprocess(&app);
         });
         grid_el
             .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
@@ -166,6 +185,10 @@ pub fn wire_toolbar(document: &Document, app: &Rc<RefCell<App>>) {
                 let mut a = app.borrow_mut();
                 a.commit_text_session(); // commit any open text entry before switching tools
                 a.clear_selection();     // switching tools always drops any active selection
+                // If leaving BgMove via toolbar (not via accept/cancel), clean up the
+                // visual state — blinking button and image-controls strip — without
+                // reverting the background position.
+                if a.tool == Tool::BgMove { a.leave_bg_move_ui(); }
                 a.tool = tool;
             }
 
@@ -427,94 +450,64 @@ pub fn wire_blend_mode(document: &Document, app: &Rc<RefCell<App>>) {
     }
 }
 
-/// Wire the ⧉ copy button to copy the full canvas as plain text to the clipboard.
-/// Clipboard write is async (browser API returns a Promise); spawn_local bridges
-/// Rust async/await to the JS microtask queue without blocking.
-/// On failure (e.g. permission denied) the button flashes red briefly.
+/// Wire the ⧉ copy button and Ctrl+C shortcut to copy the canvas as both plain
+/// text and styled HTML in a single ClipboardItem. The receiving app picks the
+/// richest format it understands — terminals get plain text, Notion/Docs/Slack
+/// get a styled <pre> block with the current theme colors.
 ///
-/// navigator.clipboard is accessed via js_sys::Reflect rather than web-sys typed
-/// bindings, since the Clipboard interface is not available as a web-sys feature
-/// in the version pinned by this toolchain.
+/// If a selection is active, only the selected region is copied; otherwise the
+/// full canvas is used — matching the plain-text behaviour exactly.
+///
+/// The JS helper `charpaintCopyRich(plain, html)` (defined in index.html) handles
+/// the ClipboardItem/Blob construction. It is called via js_sys::Reflect to avoid
+/// the need for wasm_bindgen extern declarations.
 pub fn wire_copy(document: &Document, app: &Rc<RefCell<App>>) {
     let btn = match document.get_element_by_id("btn-copy") {
         Some(el) => el,
         None => return,
     };
 
-    let app      = Rc::clone(app);
-    let app_kb   = Rc::clone(&app); // separate clone for the keyboard handler below
+    let app    = Rc::clone(app);
+    let app_kb = Rc::clone(&app);
     let btn_copy = btn.clone();
 
+    // Button click handler.
     let cb = Closure::<dyn FnMut()>::new(move || {
-        // Borrow app only long enough to build the text — dropped before spawn_local.
-        // If a selection is active, copy only that region; otherwise copy the full canvas.
-        let text = {
+        let (plain, html) = {
             let a = app.borrow();
-            a.selected_text().unwrap_or_else(|| a.canvas_text())
+            let p = a.selected_text().unwrap_or_else(|| a.canvas_text());
+            let h = a.selected_html().unwrap_or_else(|| a.canvas_html());
+            (p, h)
         };
-
-        // Flash immediately — feedback should feel instant, not wait for the Promise.
         flash_button(&btn_copy);
-
         let btn = btn_copy.clone();
         spawn_local(async move {
-            let result = (|| -> Result<js_sys::Promise, wasm_bindgen::JsValue> {
-                let window    = web_sys::window().unwrap();
-                let nav       = js_sys::Reflect::get(&window, &"navigator".into())?;
-                let clipboard = js_sys::Reflect::get(&nav, &"clipboard".into())?;
-                let write_fn  = js_sys::Reflect::get(&clipboard, &"writeText".into())?;
-                let write_fn: js_sys::Function = write_fn.dyn_into()?;
-                let promise   = write_fn.call1(&clipboard, &text.into())?;
-                promise.dyn_into::<js_sys::Promise>()
-            })();
-
-            match result {
-                Ok(promise) => {
-                    if wasm_bindgen_futures::JsFuture::from(promise).await.is_err() {
-                        flash_button_error(&btn);
-                    }
-                }
-                Err(_) => flash_button_error(&btn), // clipboard API not available
+            if rich_copy(plain, html).await.is_err() {
+                flash_button_error(&btn);
             }
         });
     });
-
-    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-        .unwrap();
+    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
     cb.forget();
 
-    // Ctrl+C keyboard shortcut — fires the same copy logic as the button click.
-    // Listening on window so focus doesn't need to be on any particular element.
+    // Ctrl+C keyboard shortcut — same logic, wired on window so no focus required.
     {
         let window: Window = web_sys::window().unwrap();
-        let app      = app_kb.clone();
         let btn_copy = document.get_element_by_id("btn-copy");
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
             if e.key().as_str() == "c" && e.ctrl_key() && !e.shift_key() {
                 e.prevent_default();
-                let text = {
-                    let a = app.borrow();
-                    a.selected_text().unwrap_or_else(|| a.canvas_text())
+                let (plain, html) = {
+                    let a = app_kb.borrow();
+                    let p = a.selected_text().unwrap_or_else(|| a.canvas_text());
+                    let h = a.selected_html().unwrap_or_else(|| a.canvas_html());
+                    (p, h)
                 };
                 if let Some(ref btn) = btn_copy { flash_button(btn); }
                 let btn = btn_copy.clone();
                 spawn_local(async move {
-                    let result = (|| -> Result<js_sys::Promise, wasm_bindgen::JsValue> {
-                        let window    = web_sys::window().unwrap();
-                        let nav       = js_sys::Reflect::get(&window, &"navigator".into())?;
-                        let clipboard = js_sys::Reflect::get(&nav, &"clipboard".into())?;
-                        let write_fn  = js_sys::Reflect::get(&clipboard, &"writeText".into())?;
-                        let write_fn: js_sys::Function = write_fn.dyn_into()?;
-                        let promise   = write_fn.call1(&clipboard, &text.into())?;
-                        promise.dyn_into::<js_sys::Promise>()
-                    })();
-                    match result {
-                        Ok(promise) => {
-                            if wasm_bindgen_futures::JsFuture::from(promise).await.is_err() {
-                                if let Some(ref btn) = btn { flash_button_error(btn); }
-                            }
-                        }
-                        Err(_) => { if let Some(ref btn) = btn { flash_button_error(btn); } }
+                    if rich_copy(plain, html).await.is_err() {
+                        if let Some(ref b) = btn { flash_button_error(b); }
                     }
                 });
             }
@@ -522,6 +515,24 @@ pub fn wire_copy(document: &Document, app: &Rc<RefCell<App>>) {
         window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
+}
+
+/// Call the `charpaintCopyRich(plain, html)` JS helper and await its Promise.
+/// Returns Err if the helper is missing or the clipboard write is denied.
+async fn rich_copy(plain: String, html: String) -> Result<(), ()> {
+    let promise = (|| -> Result<js_sys::Promise, wasm_bindgen::JsValue> {
+        let window  = web_sys::window().unwrap();
+        let fn_val  = js_sys::Reflect::get(&window, &"charpaintCopyRich".into())?;
+        let fn_val: js_sys::Function = fn_val.dyn_into()?;
+        let promise = fn_val.call2(
+            &wasm_bindgen::JsValue::UNDEFINED,
+            &plain.into(),
+            &html.into(),
+        )?;
+        promise.dyn_into::<js_sys::Promise>()
+    })().map_err(|_| ())?;
+
+    wasm_bindgen_futures::JsFuture::from(promise).await.map(|_| ()).map_err(|_| ())
 }
 
 /// Wire the `#pencil-tool-btn` pencil button.
@@ -597,6 +608,7 @@ fn pencil_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
             let mut a = app.borrow_mut();
             a.commit_text_session();
             a.clear_selection();
+            if a.tool == Tool::BgMove { a.leave_bg_move_ui(); }
             a.tool = Tool::Pencil;
         }
         let all = document.query_selector_all("[data-tool]").unwrap();
@@ -683,8 +695,9 @@ fn line_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
     } else {
         {
             let mut a = app.borrow_mut();
-            a.commit_text_session(); // commit any open text entry before switching to line tool
+            a.commit_text_session();
             a.clear_selection();
+            if a.tool == Tool::BgMove { a.leave_bg_move_ui(); }
             a.tool = Tool::Line;
         }
         let all = document.query_selector_all("[data-tool]").unwrap();
@@ -944,6 +957,7 @@ pub fn wire_touch(document: &Document, app: &Rc<RefCell<App>>) {
                             a.update_bg_from_pinch(ratio, pivot_x, pivot_y, pan_dx, pan_dy);
                             a.pan_last_mid = (mid_x, mid_y);
                         }
+                        schedule_zoom_reprocess(&app);
                     } else {
                         // Normal: zoom grid font size and scroll canvas-wrap.
                         let new_font: f64;
@@ -1108,6 +1122,7 @@ fn fill_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) {
             let mut a = app.borrow_mut();
             a.commit_text_session();
             a.clear_selection();
+            if a.tool == Tool::BgMove { a.leave_bg_move_ui(); }
             a.tool = Tool::Fill;
         }
         // Sync icon/title to the current fill_mode (may have been cycled previously).
@@ -1730,66 +1745,7 @@ fn bg_move_tool_tap(app: &Rc<RefCell<App>>, btn: &Element, document: &Document) 
 /// The strip is shown/hidden by App::enter_bg_move / accept/cancel_bg_move.
 /// This function only attaches the per-control event handlers.
 pub fn wire_image_controls(document: &Document, app: &Rc<RefCell<App>>) {
-    // ◀ Less texture sharpening
-    if let Some(btn) = document.get_element_by_id("texture-dec") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().adjust_texture(-1);
-        });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // ▶ More texture sharpening
-    if let Some(btn) = document.get_element_by_id("texture-inc") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().adjust_texture(1);
-        });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // Click on "Texture" label — reset to zero
-    if let Some(el) = document.get_element_by_id("texture-label") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().reset_texture();
-        });
-        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // ◀ Less pop sharpening
-    if let Some(btn) = document.get_element_by_id("pop-dec") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().adjust_pop(-1);
-        });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // ▶ More pop sharpening
-    if let Some(btn) = document.get_element_by_id("pop-inc") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().adjust_pop(1);
-        });
-        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // Click on "Pop" label — reset to zero
-    if let Some(el) = document.get_element_by_id("pop-label") {
-        let app = Rc::clone(app);
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().reset_pop();
-        });
-        el.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
+    // Texture/Pop USM controls removed — sidelined for future rework.
     // Hide checkbox — checked hides the strip; unchecked shows it again.
     if let Some(el) = document.get_element_by_id("image-controls-hide") {
         let app = Rc::clone(app);

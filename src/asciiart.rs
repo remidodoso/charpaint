@@ -136,6 +136,7 @@ fn box_blur_h(src: &[u8], w: usize, h: usize, r: usize) -> Vec<f32> {
 
 /// Horizontal box blur on f32 data — same logic as box_blur_h but accepts f32 input
 /// so it can be chained after a first blur pass without converting back to u8.
+#[allow(dead_code)]
 fn box_blur_hf(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let mut dst = vec![0f32; w * h];
     for y in 0..h {
@@ -170,6 +171,7 @@ fn box_blur_v(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 /// Uses a single separable box blur at a fixed radius (~10px ≈ 3pt at PROCESSING_HEIGHT 1024).
 /// `amount_step` 0 returns a plain clone — no blur is computed.
 /// Each step above 0 adds 0.5 to the USM factor (steps 1–5 → factors 0.5–2.5).
+#[allow(dead_code)]
 pub fn apply_texture(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
     if amount_step == 0 { return luma.to_vec(); }
     let factor         = amount_step as f32 * 0.5;
@@ -187,6 +189,7 @@ pub fn apply_texture(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
 /// Uses two separable box blur passes at a fixed radius (~45px ≈ one canvas cell at
 /// PROCESSING_HEIGHT 1024). Two passes approximate a triangular kernel, giving smoother
 /// halos at large radius than a single pass. `amount_step` 0 is a no-op clone.
+#[allow(dead_code)]
 pub fn apply_pop(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
     if amount_step == 0 { return luma.to_vec(); }
     let factor         = amount_step as f32 * 0.5;
@@ -200,6 +203,19 @@ pub fn apply_pop(luma: &[u8], w: u32, h: u32, amount_step: u32) -> Vec<u8> {
         .map(|(&orig, &blur)| {
             (orig as f32 + factor * (orig as f32 - blur)).max(0.0).min(255.0).round() as u8
         })
+        .collect()
+}
+
+/// Apply a separable (H then V) box blur and return the result as `u8`.
+/// Used as a scale-matched pre-blur before Sobel: suppresses edges finer than `radius`
+/// processing pixels, leaving only edges at the spatial scale of a character cell or larger.
+pub fn scale_blur(src: &[u8], w: u32, h: u32, radius: usize) -> Vec<u8> {
+    if radius == 0 { return src.to_vec(); }
+    let wu = w as usize;
+    let hu = h as usize;
+    box_blur_v(&box_blur_h(src, wu, hu, radius), wu, hu, radius)
+        .into_iter()
+        .map(|v| v.round() as u8)
         .collect()
 }
 

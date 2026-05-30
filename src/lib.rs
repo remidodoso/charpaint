@@ -476,7 +476,14 @@ pub(crate) struct App {
     /// None until first rebuild_from_params call after image load.
     pub(crate) bg_luma:        Option<Vec<u8>>,
     pub(crate) bg_luma_width:  u32,
-    pub(crate) bg_luma_height: u32,
+    pub(crate) bg_luma_height: u32,  // current processed image height
+    /// Dimensions of bg_luma_raw — the original downsample from the loaded image.
+    /// Never changes after image load; used for zoom limits and raw-coordinate math.
+    pub(crate) bg_luma_raw_width:  u32,
+    pub(crate) bg_luma_raw_height: u32,
+    /// Generation counter for the zoom debounce timer. Bumped on every zoom event;
+    /// a pending timeout only reprocesses if its captured gen still matches.
+    pub(crate) zoom_debounce_gen: u32,
 
     /// Texture sharpening step in [0, MAX_TEXTURE]; 0 = no sharpening.
     /// Applied to bg_luma_raw via unsharp mask to produce bg_luma before edge detection.
@@ -537,13 +544,6 @@ pub(crate) struct App {
     image_controls_hide_el: web_sys::HtmlInputElement,
     /// #bg-move-btn — held so enter/accept/cancel_bg_move can add/remove `.blinking`.
     bg_move_btn_el: Element,
-    /// ◀ / ▶ buttons for texture sharpening — kept here so sync_texture_buttons can
-    /// add/remove the `disabled` class without a document lookup on every change.
-    texture_dec_el: Element,
-    texture_inc_el: Element,
-    /// ◀ / ▶ buttons for pop sharpening.
-    pop_dec_el: Element,
-    pop_inc_el: Element,
 
     // ── Touch / pinch-zoom state ─────────────────────────────────────────────
     grid_el:                          Element,      // #grid element — target for font-size changes
@@ -555,7 +555,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element, aa_charset_btn_el: Element, image_controls_el: Element, image_controls_hide_el: web_sys::HtmlInputElement, texture_dec_el: Element, texture_inc_el: Element, pop_dec_el: Element, pop_inc_el: Element, bg_move_btn_el: Element) -> Self {
+    fn new(cell_els: Vec<Element>, grid_el: Element, text_input_el: HtmlInputElement, aa_btn_el: Element, bg_eye_el: Element, aa_charset_btn_el: Element, image_controls_el: Element, image_controls_hide_el: web_sys::HtmlInputElement, bg_move_btn_el: Element) -> Self {
         App {
             grid: Grid::new(),
             cell_els,
@@ -598,6 +598,9 @@ impl App {
             bg_luma:               None,
             bg_luma_width:         0,
             bg_luma_height:        0,
+            bg_luma_raw_width:     0,
+            bg_luma_raw_height:    0,
+            zoom_debounce_gen:     0,
             texture_amount:        0,
             pop_amount:            0,
             bg_edges:              None,
@@ -615,10 +618,6 @@ impl App {
             image_controls_el,
             image_controls_hide_el,
             bg_move_btn_el,
-            texture_dec_el,
-            texture_inc_el,
-            pop_dec_el,
-            pop_inc_el,
         }
     }
 
@@ -1219,6 +1218,18 @@ impl App {
         Some(out)
     }
 
+    /// Render the full canvas as a styled HTML snippet suitable for rich clipboard copy.
+    /// Wraps the plain-text content in a <pre> with inline CSS matching the current theme,
+    /// so pasting into Notion, Docs, Slack, etc. preserves monospace font and colors.
+    pub(crate) fn canvas_html(&self) -> String {
+        html_wrap(self.dark_mode, &self.canvas_text())
+    }
+
+    /// Render only the selected region as styled HTML. Returns None if no selection.
+    pub(crate) fn selected_html(&self) -> Option<String> {
+        Some(html_wrap(self.dark_mode, &self.selected_text()?))
+    }
+
     // ── Touch / zoom ─────────────────────────────────────────────────────────
 
     /// Regenerate the full inline style string for #grid from current state and apply it.
@@ -1386,22 +1397,20 @@ impl App {
         // Store the stretched-but-unadjusted luma so contrast can be re-applied
         // later without reloading the image. rebuild_from_params derives bg_luma
         // and bg_edges from this raw copy whenever a parameter changes.
-        self.bg_luma_raw    = Some(luma);
-        self.bg_luma_width  = proc_w;
-        self.bg_luma_height = proc_h;
+        self.bg_luma_raw        = Some(luma);
+        self.bg_luma_width      = proc_w;
+        self.bg_luma_height     = proc_h;
+        self.bg_luma_raw_width  = proc_w;  // canonical raw dims — never changed after load
+        self.bg_luma_raw_height = proc_h;
         self.init_bg_layout();   // cover+center before first render
         self.rebuild_from_params(); // sets bg_luma, bg_edges, calls rebuild_background
         // Unlock the AA brush and eye toggle; reset visibility to shown.
         self.enable_aa_btn();
-        self.enable_bg_eye(); // must run before auto-BgMove (it exits BgMove if already active)
-        // On first image load in a new project, automatically enter BgMove so the
-        // user is immediately invited to frame the image. TBD: reset is_new_project
-        // to true on a future "New Project" action.
-        if self.is_new_project {
-            self.is_new_project = false;
-            self.enter_bg_move();
-            self.restore_tool_active_class(Tool::BgMove);
-        }
+        self.enable_bg_eye(); // must run before auto-BgMove (it calls accept_bg_move if already active)
+        // Always auto-enter BgMove on image drop so the user is immediately invited
+        // to frame the image, regardless of whether this is the first drop or not.
+        self.enter_bg_move();
+        self.restore_tool_active_class(Tool::BgMove);
     }
 
     /// Re-render the stored luma data as a background image according to the current
@@ -1531,10 +1540,59 @@ impl App {
     /// Accept current position and exit BgMove mode, restoring the previous tool.
     /// Called on second-click, Enter, or when a new image is dropped.
     pub(crate) fn accept_bg_move(&mut self) {
+        // Reprocess edges at current scale before exiting so display and matching align.
+        // Bumps debounce gen as a side effect — any pending debounce timer will no-op.
+        self.reprocess_edges_for_scale();
         let prev = self.prev_tool.take().unwrap_or(Tool::Pencil);
         self.bg_move_saved = None;
         self.tool = prev;
         self.restore_tool_active_class(prev);
+        self.hide_image_controls();
+        let _ = self.bg_move_btn_el.class_list().remove_1("blinking");
+    }
+
+    /// Increment the zoom debounce generation counter and return the new value.
+    /// The wiring layer captures this value in the pending timeout closure; if the
+    /// generation has advanced by the time the timer fires, the closure no-ops.
+    pub(crate) fn bump_zoom_debounce(&mut self) -> u32 {
+        self.zoom_debounce_gen = self.zoom_debounce_gen.wrapping_add(1);
+        self.zoom_debounce_gen
+    }
+
+    /// Recompute bg_edges from bg_luma_raw using a pre-blur radius matched to the
+    /// current zoom level. At zoom-out (large cell_w) a wide blur suppresses fine edges
+    /// so only cell-scale structure survives Sobel; at zoom-in (small cell_w) a narrow
+    /// blur lets finer edges through. bg_luma, bg_pos/disp, and all CSS are untouched.
+    pub(crate) fn reprocess_edges_for_scale(&mut self) {
+        let raw = match self.bg_luma_raw.as_ref() {
+            Some(r) => r,
+            None    => return,
+        };
+        let w = self.bg_luma_raw_width;
+        let h = self.bg_luma_raw_height;
+        if w == 0 || h == 0 { return; }
+
+        // Feature size of a 12pt font stroke ≈ 1pt ≈ 1/300 of canvas height.
+        // In processing pixels: feature = cell_h / 12.5 where cell_h = pixels per row.
+        // Pre-blur at this radius suppresses sub-feature noise before Sobel.
+        let cell_h = self.bg_visible_rect.3;
+        let radius  = ((cell_h / 12.5).round() as usize).max(1);
+
+        let blurred = asciiart::scale_blur(raw, w, h, radius);
+        let mut edges = asciiart::sobel_edges(&blurred, w, h);
+        asciiart::enhance_edges(&mut edges);
+
+        // Bump debounce gen so any pending timer fires as a no-op.
+        self.zoom_debounce_gen = self.zoom_debounce_gen.wrapping_add(1);
+
+        self.bg_edges = Some(edges);
+        self.rebuild_background();
+    }
+
+    /// Remove the BgMove visual state (blinking button, image-controls strip) without
+    /// touching tool state or background position. Called when another tool is selected
+    /// via the toolbar, bypassing the normal accept/cancel paths.
+    pub(crate) fn leave_bg_move_ui(&mut self) {
         self.hide_image_controls();
         let _ = self.bg_move_btn_el.class_list().remove_1("blinking");
     }
@@ -1620,15 +1678,16 @@ impl App {
         pan_dx: f64,
         pan_dy: f64,
     ) {
-        if self.bg_luma_width == 0 { return; }
-        let proc_w = self.bg_luma_width  as f64;
-        let proc_h = self.bg_luma_height as f64;
+        if self.bg_luma_raw_width == 0 { return; }
+        // Use raw dims for zoom limits so limits remain stable across reprocess cycles.
+        let raw_w  = self.bg_luma_raw_width  as f64;
+        let raw_h  = self.bg_luma_raw_height as f64;
         let grid_w = self.grid_el.client_width()  as f64;
         let grid_h = self.grid_el.client_height() as f64;
 
-        let contain_scale = (grid_w / proc_w).min(grid_h / proc_h);
+        let contain_scale = (grid_w / raw_w).min(grid_h / raw_h);
         let new_disp_w    = (self.pinch_start_bg_disp_w * ratio)
-            .clamp(proc_w * contain_scale * 0.5, proc_w * 2.0);
+            .clamp(raw_w * contain_scale * 0.5, raw_w * 2.0);
         let actual_scale  = new_disp_w / self.bg_disp_w;
         let new_disp_h    = self.bg_disp_h * actual_scale;
 
@@ -1650,18 +1709,19 @@ impl App {
     /// `delta` is signed scroll distance — positive zooms out, negative zooms in.
     /// Scale clamped to [half-contain, 2× natural size].
     pub(crate) fn zoom_bg_image(&mut self, delta: f64, pivot_x: f64, pivot_y: f64) {
-        if self.bg_luma_width == 0 { return; }
-        let proc_w = self.bg_luma_width  as f64;
-        let proc_h = self.bg_luma_height as f64;
+        if self.bg_luma_raw_width == 0 { return; }
+        // Use raw dims for zoom limits so limits remain stable across reprocess cycles.
+        let raw_w  = self.bg_luma_raw_width  as f64;
+        let raw_h  = self.bg_luma_raw_height as f64;
         let grid_w = self.grid_el.client_width()  as f64;
         let grid_h = self.grid_el.client_height() as f64;
 
         let factor = if delta > 0.0 { 0.9 } else { 1.0 / 0.9 };
 
         // Max = 2× natural; min = half the contain scale.
-        let contain_scale = (grid_w / proc_w).min(grid_h / proc_h);
+        let contain_scale = (grid_w / raw_w).min(grid_h / raw_h);
         let new_disp_w    = (self.bg_disp_w * factor)
-            .clamp(proc_w * contain_scale * 0.5, proc_w * 2.0);
+            .clamp(raw_w * contain_scale * 0.5, raw_w * 2.0);
         let actual_scale  = new_disp_w / self.bg_disp_w;
         let new_disp_h    = self.bg_disp_h * actual_scale;
 
@@ -1732,11 +1792,10 @@ impl App {
         let w = self.bg_luma_width;
         let h = self.bg_luma_height;
         if w == 0 || h == 0 { return; }
+        // USM (texture/pop) sidelined — pass raw luma directly to Sobel.
+        // apply_texture / apply_pop are preserved in asciiart.rs for future use.
         let luma = match self.bg_luma_raw.as_ref() {
-            Some(raw) => {
-                let after_texture = asciiart::apply_texture(raw, w, h, self.texture_amount);
-                asciiart::apply_pop(&after_texture, w, h, self.pop_amount)
-            }
+            Some(raw) => raw.clone(),
             None => return,
         };
         let mut edges = asciiart::sobel_edges(&luma, w, h);
@@ -1748,6 +1807,7 @@ impl App {
 
     /// Add delta to texture_amount (clamped to [0, MAX_TEXTURE]) and rebuild.
     /// No-ops silently if already at the limit in that direction.
+    #[allow(dead_code)]
     pub(crate) fn adjust_texture(&mut self, delta: i32) {
         let new_val = (self.texture_amount as i32 + delta).clamp(0, MAX_TEXTURE as i32) as u32;
         if new_val == self.texture_amount { return; }
@@ -1757,6 +1817,7 @@ impl App {
     }
 
     /// Reset texture sharpening to zero and rebuild.
+    #[allow(dead_code)]
     pub(crate) fn reset_texture(&mut self) {
         if self.texture_amount == 0 { return; }
         self.texture_amount = 0;
@@ -1765,20 +1826,12 @@ impl App {
     }
 
     /// Sync disabled class on the ◀/▶ texture buttons to reflect the current amount.
-    fn sync_texture_buttons(&self) {
-        if self.texture_amount == 0 {
-            let _ = self.texture_dec_el.class_list().add_1("disabled");
-        } else {
-            let _ = self.texture_dec_el.class_list().remove_1("disabled");
-        }
-        if self.texture_amount >= MAX_TEXTURE {
-            let _ = self.texture_inc_el.class_list().add_1("disabled");
-        } else {
-            let _ = self.texture_inc_el.class_list().remove_1("disabled");
-        }
-    }
+    /// No-op: buttons removed from UI; preserved for future reinstatement.
+    #[allow(dead_code)]
+    fn sync_texture_buttons(&self) {}
 
     /// Add delta to pop_amount (clamped to [0, MAX_POP]) and rebuild.
+    #[allow(dead_code)]
     pub(crate) fn adjust_pop(&mut self, delta: i32) {
         let new_val = (self.pop_amount as i32 + delta).clamp(0, MAX_POP as i32) as u32;
         if new_val == self.pop_amount { return; }
@@ -1788,6 +1841,7 @@ impl App {
     }
 
     /// Reset pop sharpening to zero and rebuild.
+    #[allow(dead_code)]
     pub(crate) fn reset_pop(&mut self) {
         if self.pop_amount == 0 { return; }
         self.pop_amount = 0;
@@ -1796,18 +1850,9 @@ impl App {
     }
 
     /// Sync disabled class on the ◀/▶ pop buttons to reflect the current amount.
-    fn sync_pop_buttons(&self) {
-        if self.pop_amount == 0 {
-            let _ = self.pop_dec_el.class_list().add_1("disabled");
-        } else {
-            let _ = self.pop_dec_el.class_list().remove_1("disabled");
-        }
-        if self.pop_amount >= MAX_POP {
-            let _ = self.pop_inc_el.class_list().add_1("disabled");
-        } else {
-            let _ = self.pop_inc_el.class_list().remove_1("disabled");
-        }
-    }
+    /// No-op: buttons removed from UI; preserved for future reinstatement.
+    #[allow(dead_code)]
+    fn sync_pop_buttons(&self) {}
 
     // ── AA brush ─────────────────────────────────────────────────────────────
 
@@ -2253,6 +2298,29 @@ fn art_char(dc: i32, dr: i32) -> char {
 }
 
 
+// ── HTML clipboard helpers ────────────────────────────────────────────────────
+
+/// Escape the three characters that are special in HTML text content.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Wrap plain-text canvas content in a styled <pre> block for rich clipboard copy.
+/// No foreground/background colors are embedded — those belong to per-cell spans
+/// once color support is added; for now the receiving app's default text color is fine.
+/// Trailing spaces are trimmed per line since most rich-text editors drop them anyway.
+fn html_wrap(_dark_mode: bool, text: &str) -> String {
+    let trimmed: String = text
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "<pre style=\"font-family:monospace;line-height:1.2;white-space:pre;padding:4px\">{}</pre>",
+        html_escape(&trimmed)
+    )
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Build timestamp injected by build.rs — format "Build: MMDD:HHMM".
@@ -2296,22 +2364,10 @@ pub fn start() {
         .expect("#image-controls-hide must exist in HTML")
         .dyn_into::<web_sys::HtmlInputElement>()
         .expect("#image-controls-hide must be an <input> element");
-    let texture_dec_el = document
-        .get_element_by_id("texture-dec")
-        .expect("#texture-dec must exist in HTML");
-    let texture_inc_el = document
-        .get_element_by_id("texture-inc")
-        .expect("#texture-inc must exist in HTML");
-    let pop_dec_el = document
-        .get_element_by_id("pop-dec")
-        .expect("#pop-dec must exist in HTML");
-    let pop_inc_el = document
-        .get_element_by_id("pop-inc")
-        .expect("#pop-inc must exist in HTML");
     let bg_move_btn_el = document
         .get_element_by_id("bg-move-btn")
         .expect("#bg-move-btn must exist in HTML");
-    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el, aa_charset_btn_el, image_controls_el, image_controls_hide_el, texture_dec_el, texture_inc_el, pop_dec_el, pop_inc_el, bg_move_btn_el)));
+    let app = Rc::new(RefCell::new(App::new(cell_els, grid_el, text_input_el, aa_btn_el, bg_eye_el, aa_charset_btn_el, image_controls_el, image_controls_hide_el, bg_move_btn_el)));
 
     // Build sprite catalogs for each charset at startup.
     app.borrow_mut().catalog_ascii7  = dom_setup::build_ascii7_catalog(&document);
